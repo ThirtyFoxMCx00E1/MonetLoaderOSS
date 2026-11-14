@@ -22,6 +22,7 @@
 #include "raknet/RakClientInterface.h"
 #include "script/modules/mimgui/renderer.h"
 #include "script/script_manager.h"
+#include "script/luavideo.h"
 #include "utils/android.h"
 #include <chrono>
 #include <dlfcn.h>
@@ -209,6 +210,7 @@ monethook::plt_hook<void()> o_cgame_process;
 void h_cgame_process()
 {
   g_had_run_lua = false;
+  luavideo::frame_tick(); // 3.8.5-mp: last frame's 3D draws are gone, old video rasters are freed
   process_touch();
   game::audiostream_sync::process();
   rakhook::process(); // Safe to call even before RakHook is initialized since it only checks queue which is filled after init
@@ -296,6 +298,20 @@ rw::RwBool h_opengl_cameraendupdate(void* out, void* camera_in, std::int32_t in)
     g_has_to_do_render = false;
   }
   return o_opengl_cameraendupdate(out, camera_in, in);
+}
+
+// 3.8.5-mp: the TV Player's video as a real 3D mesh. RenderEffects runs after the world and the peds are drawn,
+// with the scene's depth buffer, so whatever stands in front of the TV hides it (no more "ghost" picture on top).
+monethook::plt_hook<void()> o_render_effects_plt;
+monethook::hook<void()> o_render_effects;
+bool g_render_effects_plt = false;
+void h_render_effects()
+{
+  luavideo::render3d();
+  if (g_render_effects_plt)
+    o_render_effects_plt();
+  else
+    o_render_effects();
 }
 
 // ------ SA-MP ------
@@ -409,6 +425,25 @@ static void do_init_body()
   o_chid_flushqueuedtext.apply();
   o_opengl_cameraendupdate = { opengl_cameraendupdate, h_opengl_cameraendupdate };
   o_opengl_cameraendupdate.apply();
+  {
+    luavideo::init3d(handle);
+    bool ok = false;
+    // inline first (catches every caller, like AML's EVENT_SYM for RenderEffects); the PLT slot if that fails
+    if (auto fn = reinterpret_cast<std::uintptr_t>(dlsym(handle, "_Z13RenderEffectsv"))) {
+      o_render_effects = { fn, h_render_effects };
+      ok = o_render_effects.apply() == monethook::detail::hook_result::success;
+    }
+    if (!ok) {
+      if (auto plt = scanner.sym("_Z13RenderEffectsv")) {
+        o_render_effects_plt = { plt, h_render_effects };
+        g_render_effects_plt = true;
+        ok = o_render_effects_plt.apply() == monethook::detail::hook_result::success;
+        if (!ok) g_render_effects_plt = false;
+      }
+    }
+    luavideo::set_hooked3d(ok);
+    __android_log_print(ANDROID_LOG_INFO, "MonetVideo", "RenderEffects hook: %s", ok ? (g_render_effects_plt ? "PLT" : "inline") : "FAILED (TV Player uses the 2D picture)");
+  }
 #if SAMP_MODE == 0
   o_and_touchevent = { lib_manager::got_and_touchevent, h_and_touchevent };
   o_and_touchevent.apply();
