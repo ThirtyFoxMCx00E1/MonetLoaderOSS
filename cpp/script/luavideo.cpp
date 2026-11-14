@@ -426,7 +426,7 @@ void Worker(Video* pv)
         const int64_t w = pts - now;
         std::this_thread::sleep_for(std::chrono::microseconds(w > 20000 ? 20000 : w));
       }
-      if (v.Now() - pts > 150000) show = false; // late: skip the conversion, keep up
+      if (v.Now() - pts > 150000 && v.frames > 0) show = false; // late: skip the conversion, keep up (never the first)
     }
     if (v.reader) {
       const bool draw = show && v.seekReq.load() < 0;
@@ -540,7 +540,8 @@ int Open(const std::string& path)
   // power-of-two texture (GLES2 shows NPOT textures black with REPEAT / mipmaps); the mesh's UVs cover all of it
   auto pot = [](int x, int lo, int hi) { int p = lo; while (p < hi && p * 2 <= x + x / 3) p *= 2; return p; };
   v->tw = pot(v->vw, 64, 512);
-  v->th = pot((int)((int64_t)v->vh * v->tw / v->vw), 32, 512);
+  v->th = v->tw; // square (like the font atlas and MP's textures - some phones show non-square ones black); the
+                 // mesh's UVs cover the whole texture, so the picture keeps its shape on the TV
   if (!OpenAudio(*v)) VLOG("%s: no sound (OpenSL ES)", path.c_str());
   Video* raw = v.get();
   v->th_ = std::thread(Worker, raw);
@@ -559,29 +560,75 @@ Video* Get(int id)
 // script thread (= the render thread in GTA SA): the newest frame into a NEW raster. Locking the same raster again
 // did not upload on the mobile driver (the TV stayed on the first, black, frame); a fresh raster made the way
 // MonetLoader makes its images is always uploaded. The old one is freed a few frames later.
+// RwImage helpers (the way MP makes its working GIF / logo textures: RwImage -> RwImageFindRasterFormat ->
+// RwRasterCreate -> RwRasterSetFromImage). Looked up in init3d.
+rw::RwImage* (*g_imgCreate)(int, int, int) = nullptr;
+rw::RwImage* (*g_imgAlloc)(rw::RwImage*) = nullptr;
+int (*g_imgDestroy)(rw::RwImage*) = nullptr;
+rw::RwImage* (*g_imgFindFmt)(rw::RwImage*, int, int*, int*, int*, int*) = nullptr;
+rw::RwRaster* (*g_rasFromImage)(rw::RwRaster*, rw::RwImage*) = nullptr;
+rw::RwImage* g_img = nullptr; // one reusable image (square, the texture size)
+int g_imgSide = 0;
+int g_texMode = 0; // logged once: 1 = RwImage path, 2 = raster lock fallback
+
+rw::RwRaster* RasterViaImage(Video& v)
+{
+  if (!g_imgCreate || !g_imgAlloc || !g_imgFindFmt || !g_rasFromImage)
+    return nullptr;
+  if (!g_img || g_imgSide != v.tw) {
+    if (g_img && g_imgDestroy) g_imgDestroy(g_img);
+    g_img = g_imgCreate(v.tw, v.th, 32);
+    if (!g_img) return nullptr;
+    g_imgAlloc(g_img);
+    if (!g_img->cpPixels || g_img->stride < v.tw * 4) { if (g_imgDestroy) g_imgDestroy(g_img); g_img = nullptr; return nullptr; }
+    g_imgSide = v.tw;
+  }
+  for (int y = 0; y < v.th; ++y)
+    memcpy(g_img->cpPixels + (size_t)y * g_img->stride, v.front.data() + (size_t)y * v.tw * 4, (size_t)v.tw * 4);
+  int rw_ = 0, rh = 0, rd = 0, rf = 0;
+  g_imgFindFmt(g_img, rw::rwRASTERTYPETEXTURE, &rw_, &rh, &rd, &rf);
+  if (rw_ != v.tw || rh != v.th) {
+    static bool said = false;
+    if (!said) { said = true; VLOG("RwImageFindRasterFormat %dx%d != %dx%d", rw_, rh, v.tw, v.th); }
+    return nullptr;
+  }
+  rw::RwRaster* r = rw::RwRasterCreate(rw_, rh, rd, rf);
+  if (r) r = g_rasFromImage(r, g_img);
+  return r;
+}
+
+// script thread (= the render thread in GTA SA): the newest frame into a NEW raster, the same way MP makes the GIF
+// textures that show on every phone. The old raster is freed a few frames later.
 void* Texture(Video& v)
 {
   std::lock_guard<std::mutex> l(v.frMx);
   if (!v.fresh || v.front.size() < (size_t)v.tw * v.th * 4)
     return v.raster;
-  rw::RwRaster* r = rw::RwRasterCreate(v.tw, v.th, 32, static_cast<std::int32_t>(rw::rwRASTERFORMAT8888) | rw::rwRASTERTYPETEXTURE);
-  if (!r)
-    return v.raster;
-  std::uint8_t* locked = rw::RwRasterLock(r, 0, rw::rwRASTERLOCKWRITE | rw::rwRASTERLOCKNOFETCH);
-  if (!r->cpPixels && locked)
-    r->cpPixels = locked;
-  if (!r->cpPixels) {
-    r->cpPixels = static_cast<std::uint8_t*>(std::malloc((size_t)4 * r->width * r->height));
-    r->stride = 4 * r->width;
+  rw::RwRaster* r = RasterViaImage(v);
+  if (r) {
+    if (g_texMode != 1) { g_texMode = 1; VLOG("textures: RwImage + RwRasterSetFromImage (%dx%d)", v.tw, v.th); }
+  } else {
+    // fallback: lock / unlock a new raster (MonetLoader's own image loader)
+    r = rw::RwRasterCreate(v.tw, v.th, 32, static_cast<std::int32_t>(rw::rwRASTERFORMAT8888) | rw::rwRASTERTYPETEXTURE);
+    if (!r)
+      return v.raster;
+    std::uint8_t* locked = rw::RwRasterLock(r, 0, rw::rwRASTERLOCKWRITE | rw::rwRASTERLOCKNOFETCH);
+    if (!r->cpPixels && locked)
+      r->cpPixels = locked;
+    if (!r->cpPixels) {
+      r->cpPixels = static_cast<std::uint8_t*>(std::malloc((size_t)4 * r->width * r->height));
+      r->stride = 4 * r->width;
+    }
+    if (r->cpPixels) {
+      const int stride = r->stride > 0 ? r->stride : 4 * r->width;
+      const int rows = r->height < v.th ? r->height : v.th;
+      const size_t row = (size_t)4 * (r->width < v.tw ? r->width : v.tw);
+      for (int y = 0; y < rows; ++y)
+        memcpy(r->cpPixels + (size_t)y * stride, v.front.data() + (size_t)y * v.tw * 4, row);
+    }
+    rw::RwRasterUnlock(r);
+    if (g_texMode != 2) { g_texMode = 2; VLOG("textures: raster lock fallback (%dx%d)", v.tw, v.th); }
   }
-  if (r->cpPixels) {
-    const int stride = r->stride > 0 ? r->stride : 4 * r->width;
-    const int rows = r->height < v.th ? r->height : v.th;
-    const size_t row = (size_t)4 * (r->width < v.tw ? r->width : v.tw);
-    for (int y = 0; y < rows; ++y)
-      memcpy(r->cpPixels + (size_t)y * stride, v.front.data() + (size_t)y * v.tw * 4, row);
-  }
-  rw::RwRasterUnlock(r);
   Bury(v.raster);
   v.raster = r;
   v.fresh = false;
@@ -619,6 +666,11 @@ void luavideo::init3d(void* gtasa)
   *(void**)&g_im3dRenderPrim = dlsym(gtasa, "_Z21RwIm3DRenderPrimitive15RwPrimitiveType");
   *(void**)&g_im3dRenderIdx = dlsym(gtasa, "_Z28RwIm3DRenderIndexedPrimitive15RwPrimitiveTypePti");
   *(void**)&g_im3dEnd = dlsym(gtasa, "_Z9RwIm3DEndv");
+  *(void**)&g_imgCreate = dlsym(gtasa, "_Z13RwImageCreateiii");
+  *(void**)&g_imgAlloc = dlsym(gtasa, "_Z21RwImageAllocatePixelsP7RwImage");
+  *(void**)&g_imgDestroy = dlsym(gtasa, "_Z14RwImageDestroyP7RwImage");
+  *(void**)&g_imgFindFmt = dlsym(gtasa, "_Z23RwImageFindRasterFormatP7RwImageiPiS1_S1_S1_");
+  *(void**)&g_rasFromImage = dlsym(gtasa, "_Z20RwRasterSetFromImageP8RwRasterP7RwImage");
   VLOG("Im3D: transform %p, render %p / %p, end %p", (void*)g_im3dTransform, (void*)g_im3dRenderPrim, (void*)g_im3dRenderIdx, (void*)g_im3dEnd);
 }
 
@@ -755,6 +807,11 @@ void luavideo::reg(sol::state& state)
   state["videoGetSize"] = [](int id) {
     Video* v = Get(id);
     return std::make_tuple(v ? v->vw : 0, v ? v->vh : 0);
+  };
+  // 3.8.6-mp: decoded frames / uploaded textures (the TV Player tells the player when the decoder gives nothing)
+  state["videoGetStats"] = [](int id) {
+    Video* v = Get(id);
+    return std::make_tuple(v ? v->frames : 0, v ? v->uploads : 0);
   };
   state["isRender3DAvailable"] = []() { return luavideo::available3d(); };
   state["renderDrawTexture3D"] = [](void* tex, sol::table verts, std::uint32_t argb, sol::optional<bool> depthTest) {
