@@ -3,4 +3,6 @@
 namespace mp_bridge {
 void process(); // every CGame::Process: finds MP, keeps players / peds in sync, applies emulated RPCs
 bool active();
+bool try_attach(); // 3.8.1: find MP now (script load, isSampLoaded) - true when attached
+
 }

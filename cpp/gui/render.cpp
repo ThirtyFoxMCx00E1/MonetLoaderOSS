@@ -251,8 +251,7 @@ void gui::render::render()
   imrw::render_draw_data(ImGui::GetDrawData());
 }
 
-#define WATERMARK_TEXT "Powered by MonetLoader " PROJECT_VERSION "\nBuild Date: " __DATE__ "\nOfficial Telegram: t.me/MonetLoader"
-#define WATERMARK_SIZE 40.f
+// MonetLoader for MP 3.8.1: no "Powered by MonetLoader / Official Telegram" watermark on the pause menu any more
 void gui::render::render_overlay()
 {
   if (!g_overlay_context) {
@@ -264,13 +263,6 @@ void gui::render::render_overlay()
   ImGui::NewFrame();
 
   keyboard::instance().render(g_overlay_touch.active_pointers_count() > 1);
-  if (game::IsPaused()) {
-    ImGui::GetForegroundDrawList()->AddText(ImVec2 { 8.f, 8.f }, IM_COL32_BLACK, WATERMARK_TEXT);
-    ImGui::GetForegroundDrawList()->AddText(ImVec2 { 12.f, 8.f }, IM_COL32_BLACK, WATERMARK_TEXT);
-    ImGui::GetForegroundDrawList()->AddText(ImVec2 { 8.f, 12.f }, IM_COL32_BLACK, WATERMARK_TEXT);
-    ImGui::GetForegroundDrawList()->AddText(ImVec2 { 12.f, 12.f }, IM_COL32_BLACK, WATERMARK_TEXT);
-    ImGui::GetForegroundDrawList()->AddText(ImVec2 { 10.f, 10.f }, IM_COL32_WHITE, WATERMARK_TEXT);
-  }
 
   input_system::end_frame();
   ImGui::EndFrame();

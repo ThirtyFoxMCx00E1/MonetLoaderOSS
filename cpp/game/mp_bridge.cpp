@@ -424,25 +424,51 @@ bool mp_bridge::active()
   return g_mp != nullptr;
 }
 
+// MonetLoader for MP 3.8.1: attach as soon as MP is there. Scripts are loaded from the first CTheScripts::Process,
+// which runs during the game's load - before the first CGame::Process where 3.8.0 first looked for MP. So
+// `require 'samp.events'` asserted "SA-MP is not loaded" (isSampLoaded was still false) and the script died.
+// Now script_manager::init and isSampLoaded / isSampfuncsLoaded attach right away.
+bool mp_bridge::try_attach()
+{
+  if (g_mp) {
+    return true;
+  }
+  if (g_given_up || rakhook::available()) { // real SA-MP: MonetLoader works as usual
+    return false;
+  }
+  static std::chrono::steady_clock::time_point last {};
+  const auto now = std::chrono::steady_clock::now();
+  if (g_tries > 0 && now - last < std::chrono::milliseconds(200)) {
+    return false;
+  }
+  last = now;
+  ++g_tries;
+  g_mp = find_mp();
+  if (!g_mp) {
+    return false;
+  }
+  rakhook::mp::init(mp_out_rpc, mp_out_packet, mp_apply_rpc);
+  g_mp->SetHandlers(sink, out_chat, out_dialog, nullptr);
+  spdlog::info("MonetLoader for MP: attached to MP {} - PC MoonLoader scripts run on MP servers", g_mp->Version());
+  return true;
+}
+
 void mp_bridge::process()
 {
   if (!g_mp) {
-    if (g_given_up || rakhook::available()) { // real SA-MP: MonetLoader works as usual
+    if (g_given_up || rakhook::available()) {
       return;
     }
-    if ((++g_tries % 30) != 1) {
+    static int frames = 0;
+    if ((++frames % 30) != 1) {
       return;
     }
-    g_mp = find_mp();
-    if (!g_mp) {
-      if (g_tries > 30 * 120) {
+    if (!try_attach()) {
+      if (frames > 30 * 120) {
         g_given_up = true; // ~2 min of frames without MP: singleplayer MonetLoader
       }
       return;
     }
-    rakhook::mp::init(mp_out_rpc, mp_out_packet, mp_apply_rpc);
-    g_mp->SetHandlers(sink, out_chat, out_dialog, nullptr);
-    spdlog::info("MonetLoader for MP: attached to MP {} - PC MoonLoader scripts run on MP servers", g_mp->Version());
   }
 
   rakhook::mp::pump();

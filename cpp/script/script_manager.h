@@ -122,6 +122,16 @@ class script_manager {
 
   static void register_packages(sol::state_view st); // public for effil
 
+  // MonetLoader for MP 3.8.1: MP's MonetLoader page
+  static void reload_all_later() { _reload_all_later = true; }
+  template <typename F>
+  static void for_each_script(F fn)
+  {
+    for (auto& i : _scripts) {
+      fn(i.second);
+    }
+  }
+
   private:
   using script_map_type = std::unordered_map<std::size_t, script>;
 

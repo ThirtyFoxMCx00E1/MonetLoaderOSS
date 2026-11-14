@@ -1,3 +1,4 @@
+#include "game/mp_bridge.h"
 #include "game/rakhook.h"
 #include "script_manager.h"
 #include "clipboard.h"
@@ -136,7 +137,7 @@ void lua::script_manager::init()
     return;
   }
 
-  logger::log<logger::LV_SYSTEM>(nullptr, "{}", "\n\n\n\t* MonetLoader initialized! Version: " PROJECT_VERSION "\n\t* Official Telegram: t.me/MonetLoader\n\n");
+  logger::log<logger::LV_SYSTEM>(nullptr, "{}", "\n\n\n\t* MonetLoader for MP initialized! Version: " PROJECT_VERSION "\n\n");
 
   // MP Multiplayer: PC MoonLoader scripts live in the MP folder (files/TYFMC/MP/moonloader, lib/ for the libraries)
   std::filesystem::path monetloader_path = file_manager::mp_moonloader_path();
@@ -149,6 +150,7 @@ void lua::script_manager::init()
   std::filesystem::current_path(monetloader_path);
   init_modules();
 
+  mp_bridge::try_attach(); // 3.8.1: MP first, so samp.events / isSampLoaded work in the scripts' main chunk
   gui::render::new_frame();
   load_all();
 
@@ -942,10 +944,10 @@ void lua::script_manager::register_opcode_extensions(script& s)
     return true;
   };
   state["isSampfuncsLoaded"] = []() {
-    return lib_manager::samp_base != 0 || rakhook::mp::active();
+    return lib_manager::samp_base != 0 || rakhook::mp::active() || mp_bridge::try_attach();
   };
   state["isSampLoaded"] = []() {
-    return lib_manager::samp_base != 0 || rakhook::mp::active();
+    return lib_manager::samp_base != 0 || rakhook::mp::active() || mp_bridge::try_attach();
   };
 
   state["getCharQuaternion"] = [](int self) {
@@ -1288,4 +1290,39 @@ void lua::script_manager::register_handles(script& s)
   int playerChar = opcodes::getPlayerChar(0);
   state["playerPed"] = playerChar;
   state["PLAYER_PED"] = playerChar;
+}
+// ---- MonetLoader for MP 3.8.1: MP's floating menu MonetLoader page (the MonetLoader icon on the top bar) ----------
+// Both run on the game thread (MP draws its HUD from Render2dStuff, MonetLoader runs its scripts from CGame::Process).
+// MonetMP_Scripts: one line per running script: "name\tfile\tversion\tauthors\n" into buf (cut at n), returns the count.
+// MonetMP_ReloadAll: reloads every script on the next frame (like MoonLoader's reloadScripts()).
+extern "C" __attribute__((visibility("default"))) int MonetMP_Scripts(char* buf, int n)
+{
+  if (!buf || n <= 0) {
+    return 0;
+  }
+  buf[0] = 0;
+  if (!lua::script_manager::initialized()) {
+    return 0;
+  }
+  std::string out;
+  int count = 0;
+  lua::script_manager::for_each_script([&](lua::script& sc) {
+    lua::script* s = &sc;
+    std::string authors;
+    for (auto& a : s->info.authors) {
+      authors += (authors.empty() ? "" : ", ") + a;
+    }
+    out += (s->info.name.empty() ? s->info.filename : s->info.name) + "\t" + s->info.filename + "\t" + s->info.version + "\t" + authors + (s->dead ? "\tdead" : "\trunning") + "\n";
+    ++count;
+  });
+  std::snprintf(buf, static_cast<std::size_t>(n), "%s", out.c_str());
+  return count;
+}
+extern "C" __attribute__((visibility("default"))) void MonetMP_ReloadAll()
+{
+  lua::script_manager::reload_all_later();
+}
+extern "C" __attribute__((visibility("default"))) const char* MonetMP_Version()
+{
+  return PROJECT_VERSION;
 }
