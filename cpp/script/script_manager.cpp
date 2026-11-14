@@ -1,3 +1,6 @@
+#include <dlfcn.h>
+#include <cmath>
+#include "game/CEntity.h"
 #include "luavideo.h"
 #include "game/mp_bridge.h"
 #include "game/rakhook.h"
@@ -920,6 +923,57 @@ void lua::script_manager::register_opcode_extensions(script& s)
     }
 
     return objs;
+  };
+
+  // 3.8.3-mp: map buildings / dummies / objects around a point (CWorld::FindObjectsInRange). getAllObjects only sees
+  // CObjects; furniture that is part of the map (the TV in CJ's house) is a building or a dummy and never showed up.
+  // Returns { {model=, type=1 building|4 object|5 dummy, ptr=, x=,y=,z=, heading=, rx,ry,rz (right), fx,fy,fz (forward),
+  // ux,uy,uz (up)}, ... }
+  state["getNearbyEntities"] = [](sol::this_state state, float x, float y, float z, float radius, sol::optional<int> maxn) {
+    sol::table out { state, sol::create };
+    using find_fn = void (*)(const CVector&, float, bool, short*, short, CEntity**, bool, bool, bool, bool, bool);
+    static find_fn find = nullptr;
+    static bool looked = false;
+    if (!looked) {
+      looked = true;
+      void* h = dlopen("libGTASA.so", RTLD_NOLOAD);
+      if (h) find = reinterpret_cast<find_fn>(dlsym(h, "_ZN6CWorld18FindObjectsInRangeERK7CVectorfbPssPP7CEntitybbbbb"));
+    }
+    if (!find || !(radius > 0.0f)) return out;
+    int cap = maxn.value_or(64);
+    if (cap < 1) cap = 1;
+    if (cap > 256) cap = 256;
+    CEntity* found[256] = {};
+    short n = 0;
+    CVector at; at.x = x; at.y = y; at.z = z;
+    find(at, radius, false, &n, (short)cap, found, true, false, false, true, true);
+    if (n > cap) n = cap;
+    int idx = 1;
+    for (int i = 0; i < n; ++i) {
+      CEntity* e = found[i];
+      if (!e) continue;
+      sol::table t { state, sol::create };
+      t["model"] = (int)e->nModelIndex;
+      t["type"] = (int)e->m_nType;
+      t["ptr"] = (double)reinterpret_cast<std::uintptr_t>(e);
+      if (e->m_matrix) {
+        const CMatrix* m = e->m_matrix;
+        t["x"] = m->pos.x; t["y"] = m->pos.y; t["z"] = m->pos.z;
+        t["rx"] = m->right.x; t["ry"] = m->right.y; t["rz"] = m->right.z;
+        t["fx"] = m->up.x; t["fy"] = m->up.y; t["fz"] = m->up.z;
+        t["ux"] = m->at.x; t["uy"] = m->at.y; t["uz"] = m->at.z;
+        t["heading"] = std::atan2(-m->up.x, m->up.y);
+      } else {
+        const float hd = e->m_fHeading, c = std::cos(hd), s = std::sin(hd);
+        t["x"] = e->m_vPosn.x; t["y"] = e->m_vPosn.y; t["z"] = e->m_vPosn.z;
+        t["rx"] = c; t["ry"] = s; t["rz"] = 0.0f;
+        t["fx"] = -s; t["fy"] = c; t["fz"] = 0.0f;
+        t["ux"] = 0.0f; t["uy"] = 0.0f; t["uz"] = 1.0f;
+        t["heading"] = hd;
+      }
+      out[idx++] = t;
+    }
+    return out;
   };
 
   state["setFreeGxtEntry"] = [](const char* ascii) {
