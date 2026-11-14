@@ -669,6 +669,22 @@ void* (*g_geoLock)(void*, int) = nullptr;   // 3.8.8-mp: RpGeometryLock / Unlock
 void* (*g_geoUnlock)(void*) = nullptr;
 void (*g_freeResEntry)(void*) = nullptr;      // 3.8.9-mp: RwResourcesFreeResEntry - drop the cached GPU copy of the TV mesh
 int* g_dnOffset = nullptr;                    // 3.8.9-mp: CCustomBuildingDNPipeline::ms_extraVertColourPluginOffset
+// 3.9.0-mp: the TV picture as a small model of its own (RpAtomic), drawn by the game's model pipeline
+void* (*g_geoCreate)(int, int, std::uint32_t) = nullptr;
+int (*g_geoDestroy)(void*) = nullptr;
+void* (*g_matCreate)() = nullptr;
+int (*g_matDestroy)(void*) = nullptr;
+void* (*g_triSetMat)(void*, void*, void*) = nullptr;
+void* (*g_atoCreate)() = nullptr;
+int (*g_atoDestroy)(void*) = nullptr;
+void* (*g_atoSetFrame)(void*, void*) = nullptr;
+void* (*g_atoSetGeo)(void*, void*, std::uint32_t) = nullptr;
+void* (*g_frmCreate)() = nullptr;
+int (*g_frmDestroy)(void*) = nullptr;
+void* (*g_atoRender)(void*) = nullptr;
+int g_render3dMethod = 1;                     // 1 = model (RpAtomic), 2 = RwIm3D (3.8.5 - 3.8.9)
+bool RenderAsModel(const Draw3D& d);          // (below)
+void ModelGc();
 } // namespace
 
 void luavideo::init3d(void* gtasa)
@@ -690,6 +706,20 @@ void luavideo::init3d(void* gtasa)
   *(void**)&g_geoUnlock = dlsym(gtasa, "_Z16RpGeometryUnlockP10RpGeometry");
   *(void**)&g_freeResEntry = dlsym(gtasa, "_Z23RwResourcesFreeResEntryP10RwResEntry");
   g_dnOffset = static_cast<int*>(dlsym(gtasa, "_ZN25CCustomBuildingDNPipeline30ms_extraVertColourPluginOffsetE"));
+  *(void**)&g_geoCreate = dlsym(gtasa, "_Z16RpGeometryCreateiij");
+  *(void**)&g_geoDestroy = dlsym(gtasa, "_Z17RpGeometryDestroyP10RpGeometry");
+  *(void**)&g_matCreate = dlsym(gtasa, "_Z16RpMaterialCreatev");
+  *(void**)&g_matDestroy = dlsym(gtasa, "_Z17RpMaterialDestroyP10RpMaterial");
+  *(void**)&g_triSetMat = dlsym(gtasa, "_Z29RpGeometryTriangleSetMaterialP10RpGeometryP10RpTriangleP10RpMaterial");
+  *(void**)&g_atoCreate = dlsym(gtasa, "_Z14RpAtomicCreatev");
+  *(void**)&g_atoDestroy = dlsym(gtasa, "_Z15RpAtomicDestroyP8RpAtomic");
+  *(void**)&g_atoSetFrame = dlsym(gtasa, "_Z16RpAtomicSetFrameP8RpAtomicP7RwFrame");
+  *(void**)&g_atoSetGeo = dlsym(gtasa, "_Z19RpAtomicSetGeometryP8RpAtomicP10RpGeometryj");
+  *(void**)&g_frmCreate = dlsym(gtasa, "_Z13RwFrameCreatev");
+  *(void**)&g_frmDestroy = dlsym(gtasa, "_Z14RwFrameDestroyP7RwFrame");
+  *(void**)&g_atoRender = dlsym(gtasa, "_Z27AtomicDefaultRenderCallBackP8RpAtomic");
+  VLOG("TV model: RpGeometryCreate %p, RpAtomicCreate %p, AtomicDefaultRenderCallBack %p, RwFrameCreate %p",
+       (void*)g_geoCreate, (void*)g_atoCreate, (void*)g_atoRender, (void*)g_frmCreate);
   VLOG("TV screen: RpGeometryLock %p, RwResourcesFreeResEntry %p, DN colour offset %d", (void*)g_geoLock, (void*)g_freeResEntry,
        g_dnOffset ? *g_dnOffset : -1);
   VLOG("Im3D: transform %p, render %p / %p, end %p", (void*)g_im3dTransform, (void*)g_im3dRenderPrim, (void*)g_im3dRenderIdx, (void*)g_im3dEnd);
@@ -716,6 +746,7 @@ void luavideo::frame_tick()
       g_graveyard[keep++] = g_graveyard[i];
   }
   g_graveyard.resize(keep);
+  ModelGc();
   restore_screens_if_idle();
 }
 
@@ -777,6 +808,9 @@ void luavideo::render3d()
     RwRenderStateSet(rwRENDERSTATETEXTUREADDRESS, (void*)(intptr_t)rwTEXTUREADDRESSCLAMP);
     RwRenderStateSet(rwRENDERSTATETEXTURERASTER, d.raster);
     ++g_stat3dDraws;
+    // 3.9.0-mp: the game's model pipeline (the way it draws the TV itself). RwIm3D drew the mesh but sampled the video
+    // frame as pure black on phones, while the same frame showed fine in 2D (RwIm2D).
+    if (g_render3dMethod != 2 && RenderAsModel(d)) { ++g_stat3dOk; continue; }
     // rwIM3D_VERTEXUV | rwIM3D_VERTEXXYZ | rwIM3D_VERTEXRGBA
     if (g_im3dTransform(v, n, nullptr, 0x01 | 0x08 | 0x10)) {
       if (g_im3dRenderIdx)
@@ -843,6 +877,131 @@ struct Swap {
 std::vector<Swap> g_swaps;
 
 bool Plausible(const void* p) { return p && (std::uintptr_t)p > 0x10000 && ((std::uintptr_t)p & 3) == 0; }
+
+// ---- 3.9.0-mp: the TV picture as its own model ----
+// An RpGeometry with the screen's triangles (world space, from tvplayer/screens.lua), prelit white, one material whose
+// texture's raster is the newest video frame. Drawn with AtomicDefaultRenderCallBack in RenderEffects: the depth
+// buffer is the scene's (CJ in front hides it) and the frame is sampled like any other model texture.
+struct TvModel { std::uint64_t key; XRpAtomic* atomic; void* frame; rw::RwTexture* tex; int lastFrame; };
+std::vector<TvModel> g_models;
+std::vector<std::pair<TvModel, int>> g_modelGrave;   // freed a few frames later (the render thread may still use them)
+const char* g_modelErr = "not tried";
+int g_modelBuilds = 0;
+
+std::uint64_t DrawKey(const Draw3D& d)
+{
+  std::uint64_t h = 1469598103934665603ull;
+  auto mix = [&](std::uint32_t x) { h ^= x; h *= 1099511628211ull; };
+  mix((std::uint32_t)d.verts.size());
+  for (const Im3DVertex& v : d.verts) {
+    mix((std::uint32_t)(std::int32_t)(v.x * 200)); mix((std::uint32_t)(std::int32_t)(v.y * 200)); mix((std::uint32_t)(std::int32_t)(v.z * 200));
+    mix((std::uint32_t)(std::int32_t)(v.u * 1000)); mix((std::uint32_t)(std::int32_t)(v.v * 1000)); mix(v.color);
+  }
+  return h;
+}
+
+void FreeModel(TvModel& m)
+{
+  if (m.tex) m.tex->raster = nullptr;   // the video rasters are MonetLoader's (graveyard), not the texture's
+  if (m.atomic && g_atoDestroy) g_atoDestroy(m.atomic);   // its geometry -> material -> texture go with it
+  if (m.frame && g_frmDestroy) g_frmDestroy(m.frame);
+  m.atomic = nullptr; m.frame = nullptr; m.tex = nullptr;
+}
+
+void ModelGc()
+{
+  size_t keep = 0;
+  for (size_t i = 0; i < g_modelGrave.size(); ++i) {
+    if (g_frame - g_modelGrave[i].second > 4) FreeModel(g_modelGrave[i].first);
+    else g_modelGrave[keep++] = g_modelGrave[i];
+  }
+  g_modelGrave.resize(keep);
+  keep = 0;
+  for (size_t i = 0; i < g_models.size(); ++i) {
+    if (g_frame - g_models[i].lastFrame > 120) g_modelGrave.emplace_back(g_models[i], g_frame);
+    else g_models[keep++] = g_models[i];
+  }
+  g_models.resize(keep);
+}
+
+bool BuildModel(const Draw3D& d, TvModel& out)
+{
+  if (!g_geoCreate || !g_geoUnlock || !g_matCreate || !g_triSetMat || !g_atoCreate || !g_atoSetFrame || !g_atoSetGeo ||
+      !g_frmCreate || !g_atoRender || !g_texCreate) { g_modelErr = "RenderWare functions missing"; return false; }
+  const int n = (int)(d.verts.size() / 3 * 3);
+  if (n < 3 || n > 60000) { g_modelErr = "bad vertex count"; return false; }
+  XRpGeometry* g = static_cast<XRpGeometry*>(g_geoCreate(n, n / 3, 0x02 | 0x04 | 0x08));   // POSITIONS | TEXTURED | PRELIT
+  if (!g) { g_modelErr = "RpGeometryCreate failed"; return false; }
+  if (g->numVertices != n || g->numTriangles != n / 3 || !Plausible(g->morphTarget) || !Plausible(g->morphTarget->verts) ||
+      !Plausible(g->texCoords[0]) || !Plausible(g->preLit) || !Plausible(g->triangles)) {
+    g_modelErr = "RpGeometry layout not as expected";
+    if (g_geoDestroy) g_geoDestroy(g);
+    return false;
+  }
+  float* pv = g->morphTarget->verts;
+  float* uv = g->texCoords[0];
+  std::uint32_t* pl = static_cast<std::uint32_t*>(g->preLit);
+  float cx = 0, cy = 0, cz = 0;
+  for (int i = 0; i < n; ++i) {
+    const Im3DVertex& v = d.verts[i];
+    pv[i * 3] = v.x; pv[i * 3 + 1] = v.y; pv[i * 3 + 2] = v.z;
+    uv[i * 2] = v.u; uv[i * 2 + 1] = v.v;
+    pl[i] = v.color | 0xFF000000u;   // r, g, b, a bytes
+    cx += v.x; cy += v.y; cz += v.z;
+  }
+  cx /= n; cy /= n; cz /= n;
+  float r2 = 0;
+  for (int i = 0; i < n; ++i) {
+    const float dx = pv[i * 3] - cx, dy = pv[i * 3 + 1] - cy, dz = pv[i * 3 + 2] - cz;
+    r2 = std::max(r2, dx * dx + dy * dy + dz * dz);
+  }
+  g->morphTarget->sphere[0] = cx; g->morphTarget->sphere[1] = cy; g->morphTarget->sphere[2] = cz;
+  g->morphTarget->sphere[3] = std::sqrt(r2) + 0.01f;
+  XRpMaterial* mat = static_cast<XRpMaterial*>(g_matCreate());
+  rw::RwTexture* tex = g_texCreate(d.raster);
+  if (!mat || !tex) { g_modelErr = "RpMaterialCreate / RwTextureCreate failed"; if (g_geoDestroy) g_geoDestroy(g); return false; }
+  tex->filterAddressing = 2u | (3u << 8) | (3u << 12);   // linear, clamp U / V
+  mat->texture = tex;                                      // the material owns the texture (refCount 1)
+  mat->color[0] = mat->color[1] = mat->color[2] = mat->color[3] = 255;
+  for (int k = 0; k < n / 3; ++k) {
+    g->triangles[k].v[0] = (std::uint16_t)(k * 3); g->triangles[k].v[1] = (std::uint16_t)(k * 3 + 1); g->triangles[k].v[2] = (std::uint16_t)(k * 3 + 2);
+    g_triSetMat(g, &g->triangles[k], mat);
+  }
+  if (g_matDestroy) g_matDestroy(mat);   // the geometry's material list keeps it
+  g_geoUnlock(g);                        // builds the mesh
+  void* atomic = g_atoCreate();
+  void* frame = g_frmCreate();
+  if (!atomic || !frame) { g_modelErr = "RpAtomicCreate / RwFrameCreate failed"; if (g_geoDestroy) g_geoDestroy(g); return false; }
+  g_atoSetFrame(atomic, frame);
+  g_atoSetGeo(atomic, g, 0);
+  if (g_geoDestroy) g_geoDestroy(g);     // the atomic keeps it
+  out.key = DrawKey(d); out.atomic = static_cast<XRpAtomic*>(atomic); out.frame = frame; out.tex = tex; out.lastFrame = g_frame;
+  if (++g_modelBuilds <= 3) VLOG("TV model: built (%d triangles)", n / 3);
+  g_modelErr = "ok";
+  return true;
+}
+
+bool RenderAsModel(const Draw3D& d)
+{
+  const std::uint64_t key = DrawKey(d);
+  TvModel* m = nullptr;
+  for (auto& x : g_models) if (x.key == key) { m = &x; break; }
+  if (!m) {
+    if (g_models.size() >= 8) { g_modelGrave.emplace_back(g_models.front(), g_frame); g_models.erase(g_models.begin()); }
+    TvModel nm {};
+    if (!BuildModel(d, nm)) {
+      static int said = 0;
+      if (said++ < 3) VLOG("TV model: %s - RwIm3D is used", g_modelErr);
+      return false;
+    }
+    g_models.push_back(nm);
+    m = &g_models.back();
+  }
+  m->lastFrame = g_frame;
+  m->tex->raster = d.raster;
+  g_atoRender(m->atomic);
+  return true;
+}
 
 void* CollectAtomic(void* a, void* data) { static_cast<std::vector<XRpAtomic*>*>(data)->push_back((XRpAtomic*)a); return a; }
 
@@ -1143,7 +1302,9 @@ void luavideo::reg(sol::state& state)
   };
   state["isRender3DAvailable"] = []() { return luavideo::available3d(); };
   // 3.8.7-mp: draws queued / drawn by the 3D mesh path (the TV Player prints them)
-  state["getRender3DStats"] = []() { return std::make_tuple(g_stat3dDraws, g_stat3dOk, luavideo::available3d()); };
+  state["getRender3DStats"] = []() { return std::make_tuple(g_stat3dDraws, g_stat3dOk, luavideo::available3d(), std::string(g_render3dMethod == 2 ? "im3d" : g_modelErr)); };
+  // 3.9.0-mp: 1 = the TV picture as its own model (default), 2 = RwIm3D (3.8.5 - 3.8.9)
+  state["setRender3DMethod"] = [](int m) { g_render3dMethod = m == 2 ? 2 : 1; };
   // 3.8.7-mp: the video on the TV model's own screen material.
   //   setEntityScreenTexture(entityPtr, raster, {cx,cy,cz}, {nx,ny,nz}, width, height) -> ok, info
   //   call it every frame with the newest frame; restoreEntityScreenTexture([entityPtr]) puts the TV's texture back
