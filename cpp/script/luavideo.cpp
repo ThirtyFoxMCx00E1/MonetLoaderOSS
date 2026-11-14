@@ -27,6 +27,9 @@
 //   - The log (logcat tag MonetVideo) says which path is used, the first frame's brightness and the upload count.
 #include "luavideo.h"
 #include "game/RenderWare.h"
+#include "game/CEntity.h"
+#include <algorithm>
+#include <cctype>
 #include "imgui/imgui.h"
 #include <SLES/OpenSLES.h>
 #include <dlfcn.h>
@@ -656,6 +659,8 @@ int (*g_im3dRenderIdx)(int, std::uint16_t*, int) = nullptr;
 int (*g_im3dEnd)() = nullptr;
 bool g_hooked3d = false;
 int g_lastRender = -1000; // g_frame of the last RenderEffects call
+rw::RwTexture* (*g_texCreate)(rw::RwRaster*) = nullptr;
+void* (*g_clumpForAll)(void*, void* (*)(void*, void*), void*) = nullptr;
 } // namespace
 
 void luavideo::init3d(void* gtasa)
@@ -671,6 +676,8 @@ void luavideo::init3d(void* gtasa)
   *(void**)&g_imgDestroy = dlsym(gtasa, "_Z14RwImageDestroyP7RwImage");
   *(void**)&g_imgFindFmt = dlsym(gtasa, "_Z23RwImageFindRasterFormatP7RwImageiPiS1_S1_S1_");
   *(void**)&g_rasFromImage = dlsym(gtasa, "_Z20RwRasterSetFromImageP8RwRasterP7RwImage");
+  *(void**)&g_texCreate = dlsym(gtasa, "_Z15RwTextureCreateP8RwRaster");
+  *(void**)&g_clumpForAll = dlsym(gtasa, "_Z20RpClumpForAllAtomicsP7RpClumpPFP8RpAtomicS2_PvES3_");
   VLOG("Im3D: transform %p, render %p / %p, end %p", (void*)g_im3dTransform, (void*)g_im3dRenderPrim, (void*)g_im3dRenderIdx, (void*)g_im3dEnd);
 }
 
@@ -695,16 +702,34 @@ void luavideo::frame_tick()
       g_graveyard[keep++] = g_graveyard[i];
   }
   g_graveyard.resize(keep);
+  restore_screens_if_idle();
 }
 
 // RenderEffects: the world (and the peds) are drawn, the depth buffer is the scene's
+// 3.8.7-mp: the vertices go into a PERSISTENT ring buffer (2 frames). The phone's RenderWare queues draws for its render
+// thread, which can read the vertex data after RwIm3DRenderPrimitive returns: 3.8.5 / 3.8.6 handed it a std::vector that was
+// freed right after (the TV mesh stayed black). The game itself always uses static buffers (TempBufferVertices), and
+// MonetLoader's ImGui renderer too - that is why the 2D picture showed and the 3D one did not.
+namespace {
+constexpr std::uint32_t kRingVerts = 6144;
+Im3DVertex g_ring[2][kRingVerts];
+std::uint16_t g_ringIdx[kRingVerts];
+bool g_ringIdxInit = false;
+int g_stat3dDraws = 0, g_stat3dOk = 0;
+}
 void luavideo::render3d()
 {
   g_lastRender = g_frame;
   if (g_draws.empty() || !available3d())
     return;
   using namespace rw;
-  int zt = 1, zw = 1, va = 0, cull = 2, fog = 0, filt = 2, addr = 1, src = 5, dst = 6;
+  if (!g_ringIdxInit) {
+    for (std::uint32_t i = 0; i < kRingVerts; ++i) g_ringIdx[i] = (std::uint16_t)i;
+    g_ringIdxInit = true;
+  }
+  Im3DVertex* ring = g_ring[g_frame & 1];
+  std::uint32_t used = 0;
+  int zt = 1, zw = 1, va = 0, cull = 2, fog = 0, filt = 2, addr = 1, src = 5, dst = 6, atf = 5, persp = 1;
   void* ras = nullptr;
   RwRenderStateGet(rwRENDERSTATEZTESTENABLE, &zt);
   RwRenderStateGet(rwRENDERSTATEZWRITEENABLE, &zw);
@@ -715,11 +740,16 @@ void luavideo::render3d()
   RwRenderStateGet(rwRENDERSTATETEXTUREADDRESS, &addr);
   RwRenderStateGet(rwRENDERSTATESRCBLEND, &src);
   RwRenderStateGet(rwRENDERSTATEDESTBLEND, &dst);
+  RwRenderStateGet(rwRENDERSTATEALPHATESTFUNCTION, &atf);
+  RwRenderStateGet(rwRENDERSTATETEXTUREPERSPECTIVE, &persp);
   RwRenderStateGet(rwRENDERSTATETEXTURERASTER, &ras);
-  static std::vector<std::uint16_t> idx;
   for (auto& d : g_draws) {
-    if (d.verts.size() < 3)
+    const std::uint32_t n = (std::uint32_t)(d.verts.size() / 3 * 3);
+    if (n < 3 || used + n > kRingVerts)
       continue;
+    Im3DVertex* v = ring + used;
+    memcpy(v, d.verts.data(), sizeof(Im3DVertex) * n);
+    used += n;
     RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)(intptr_t)(d.ztest ? 1 : 0));
     RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)(intptr_t)1);
     RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)(intptr_t)0);
@@ -727,20 +757,20 @@ void luavideo::render3d()
     RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void*)(intptr_t)rwBLENDZERO);
     RwRenderStateSet(rwRENDERSTATECULLMODE, (void*)(intptr_t)rwCULLMODECULLNONE);
     RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)(intptr_t)0);
+    RwRenderStateSet(rwRENDERSTATEALPHATESTFUNCTION, (void*)(intptr_t)8); // rwALPHATESTFUNCTIONALWAYS
+    RwRenderStateSet(rwRENDERSTATETEXTUREPERSPECTIVE, (void*)(intptr_t)1);
     RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)(intptr_t)rwFILTERLINEAR);
     RwRenderStateSet(rwRENDERSTATETEXTUREADDRESS, (void*)(intptr_t)rwTEXTUREADDRESSCLAMP);
     RwRenderStateSet(rwRENDERSTATETEXTURERASTER, d.raster);
-    const std::uint32_t n = (std::uint32_t)(d.verts.size() / 3 * 3);
+    ++g_stat3dDraws;
     // rwIM3D_VERTEXUV | rwIM3D_VERTEXXYZ | rwIM3D_VERTEXRGBA
-    if (g_im3dTransform(d.verts.data(), n, nullptr, 0x01 | 0x08 | 0x10)) {
-      if (g_im3dRenderPrim) {
+    if (g_im3dTransform(v, n, nullptr, 0x01 | 0x08 | 0x10)) {
+      if (g_im3dRenderIdx)
+        g_im3dRenderIdx(rwPRIMTYPETRILIST, g_ringIdx, (int)n);
+      else
         g_im3dRenderPrim(rwPRIMTYPETRILIST);
-      } else {
-        idx.resize(n);
-        for (std::uint32_t i = 0; i < n; ++i) idx[i] = (std::uint16_t)i;
-        g_im3dRenderIdx(rwPRIMTYPETRILIST, idx.data(), (int)n);
-      }
       g_im3dEnd();
+      ++g_stat3dOk;
     }
   }
   RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)(intptr_t)zt);
@@ -752,8 +782,165 @@ void luavideo::render3d()
   RwRenderStateSet(rwRENDERSTATETEXTUREADDRESS, (void*)(intptr_t)addr);
   RwRenderStateSet(rwRENDERSTATESRCBLEND, (void*)(intptr_t)src);
   RwRenderStateSet(rwRENDERSTATEDESTBLEND, (void*)(intptr_t)dst);
+  RwRenderStateSet(rwRENDERSTATEALPHATESTFUNCTION, (void*)(intptr_t)atf);
+  RwRenderStateSet(rwRENDERSTATETEXTUREPERSPECTIVE, (void*)(intptr_t)persp);
   RwRenderStateSet(rwRENDERSTATETEXTURERASTER, ras);
   g_draws.clear();
+}
+
+// ---- 3.8.7-mp: the video on the TV MODEL's own screen material ----
+// The game draws the TV with its own pipeline (lighting, depth, everything in front hides it), and the screen material's
+// texture is pointed at the video frame. The screen material is the one whose triangles lie on the screen rectangle
+// the script gives (tvplayer/screens.lua, model space). RenderWare 3.7 layouts as in Psdk-aml (Android RpGeometry has
+// an extra vertexBuffer field).
+namespace {
+struct XRwObject { std::uint8_t type, subType, flags, privateFlags; void* parent; };
+struct XRwLLLink { void* next; void* prev; };
+struct XRwObjectHasFrame { XRwObject object; XRwLLLink lFrame; void* sync; };
+struct XRpGeometry;
+struct XRpAtomic { XRwObjectHasFrame object; void* repEntry; XRpGeometry* geometry; };
+struct XRpMaterial { rw::RwTexture* texture; std::uint8_t color[4]; void* pipeline; float surf[3]; std::int16_t refCount; std::int16_t pad; };
+struct XRpMaterialList { XRpMaterial** materials; std::int32_t numMaterials; std::int32_t space; };
+struct XRpTriangle { std::uint16_t v[3]; std::uint16_t mat; };
+struct XRpMorphTarget { void* parent; float sphere[4]; float* verts; float* normals; };
+struct XRpGeometry {
+  XRwObject object; std::uint32_t flags; std::uint16_t locked; std::int16_t refCount;
+  std::int32_t numTriangles, numVertices, numMorphTargets, numTexCoordSets;
+  XRpMaterialList matList; XRpTriangle* triangles; void* preLit; float* texCoords[8];
+  std::uintptr_t vertexBuffer; // Android build only (Psdk-aml RpGeometry)
+  void* mesh; void* repEntry; XRpMorphTarget* morphTarget;
+};
+struct Swap {
+  std::uintptr_t ent;
+  XRpMaterial* mat;
+  rw::RwTexture* orig;
+  rw::RwTexture* ours;
+  std::uint8_t color[4];
+  int lastFrame;
+  std::string name;
+};
+std::vector<Swap> g_swaps;
+
+bool Plausible(const void* p) { return p && (std::uintptr_t)p > 0x10000 && ((std::uintptr_t)p & 3) == 0; }
+
+void* CollectAtomic(void* a, void* data) { static_cast<std::vector<XRpAtomic*>*>(data)->push_back((XRpAtomic*)a); return a; }
+
+std::vector<XRpAtomic*> Atomics(std::uintptr_t ent)
+{
+  std::vector<XRpAtomic*> out;
+  CEntity* e = reinterpret_cast<CEntity*>(ent);
+  void* obj = reinterpret_cast<void*>(e->m_pRwObject);
+  if (!Plausible(obj)) return out;
+  const std::uint8_t type = static_cast<XRwObject*>(obj)->type;
+  if (type == 1) out.push_back((XRpAtomic*)obj);                       // rpATOMIC
+  else if (type == 2 && g_clumpForAll) g_clumpForAll(obj, CollectAtomic, &out); // rpCLUMP
+  return out;
+}
+
+struct Pick { XRpMaterial* mat = nullptr; float score = 0; std::string info; };
+
+// c = screen centre, n = screen normal, w / h = screen size (model space)
+Pick FindScreen(std::uintptr_t ent, const float c[3], const float n[3], float w, float h)
+{
+  Pick best;
+  std::string list;
+  for (XRpAtomic* a : Atomics(ent)) {
+    XRpGeometry* g = Plausible(a) ? a->geometry : nullptr;
+    if (!Plausible(g) || g->object.type != 8) { list += "[geometry?]"; continue; } // rpGEOMETRY
+    const int nm = g->matList.numMaterials;
+    if (nm < 1 || nm > 64 || !Plausible(g->matList.materials)) continue;
+    const bool hasTris = Plausible(g->triangles) && g->numTriangles > 0 && g->numTriangles < 65536 && g->numMorphTargets > 0 &&
+                         Plausible(g->morphTarget) && Plausible(g->morphTarget[0].verts) && g->numVertices > 0;
+    const float* uv = (g->numTexCoordSets > 0 && Plausible(g->texCoords[0])) ? g->texCoords[0] : nullptr;
+    for (int m = 0; m < nm; ++m) {
+      XRpMaterial* mat = g->matList.materials[m];
+      if (!Plausible(mat)) continue;
+      const char* tn = Plausible(mat->texture) ? mat->texture->name : "";
+      char nameBuf[33] = {};
+      std::strncpy(nameBuf, tn, 32);
+      int tris = 0, inside = 0;
+      float area = 0, umin = 1e9f, umax = -1e9f, vmin = 1e9f, vmax = -1e9f;
+      if (hasTris) {
+        const float* V = g->morphTarget[0].verts;
+        for (int t = 0; t < g->numTriangles; ++t) {
+          const XRpTriangle& tr = g->triangles[t];
+          if ((int)tr.mat != m) continue;
+          ++tris;
+          bool in = true;
+          float p[3][3];
+          for (int k = 0; k < 3; ++k) {
+            const int vi = tr.v[k];
+            if (vi >= g->numVertices) { in = false; break; }
+            for (int j = 0; j < 3; ++j) p[k][j] = V[vi * 3 + j];
+            const float dx = p[k][0] - c[0], dy = p[k][1] - c[1], dz = p[k][2] - c[2];
+            const float d = dx * n[0] + dy * n[1] + dz * n[2];
+            const float r2 = dx * dx + dy * dy + dz * dz - d * d;
+            const float rmax = 0.5f * std::sqrt(w * w + h * h) * 1.25f + 0.03f;
+            if (std::fabs(d) > 0.08f || r2 > rmax * rmax) in = false;
+            if (uv) {
+              const float u = uv[vi * 2], vv = uv[vi * 2 + 1];
+              umin = std::min(umin, u); umax = std::max(umax, u); vmin = std::min(vmin, vv); vmax = std::max(vmax, vv);
+            }
+          }
+          if (!in) continue;
+          ++inside;
+          const float ax = p[1][0] - p[0][0], ay = p[1][1] - p[0][1], az = p[1][2] - p[0][2];
+          const float bx = p[2][0] - p[0][0], by = p[2][1] - p[0][1], bz = p[2][2] - p[0][2];
+          const float cx = ay * bz - az * by, cy = az * bx - ax * bz, cz = ax * by - ay * bx;
+          area += 0.5f * std::sqrt(cx * cx + cy * cy + cz * cz);
+        }
+      }
+      char line[160];
+      std::snprintf(line, sizeof line, "%s%s(%d tris, %d on screen, %.0f%% area, uv %.2f-%.2f/%.2f-%.2f)", list.empty() ? "" : ", ",
+                    nameBuf[0] ? nameBuf : "-", tris, inside, w * h > 0 ? 100.f * area / (w * h) : 0.f,
+                    umin < 1e8f ? umin : 0.f, umax > -1e8f ? umax : 0.f, vmin < 1e8f ? vmin : 0.f, vmax > -1e8f ? vmax : 0.f);
+      list += line;
+      if (!hasTris || tris == 0) continue;
+      // every triangle of the material on the screen rectangle, covering most of it
+      const float cover = w * h > 0 ? area / (w * h) : 0;
+      if (inside == tris && cover > 0.35f && cover > best.score) {
+        best.mat = mat;
+        best.score = cover;
+        best.info = nameBuf;
+      }
+    }
+  }
+  if (!best.mat) {
+    // no triangle data in memory: a material named like a screen
+    for (XRpAtomic* a : Atomics(ent)) {
+      XRpGeometry* g = Plausible(a) ? a->geometry : nullptr;
+      if (!Plausible(g) || g->object.type != 8 || !Plausible(g->matList.materials)) continue;
+      for (int m = 0; m < g->matList.numMaterials && m < 64; ++m) {
+        XRpMaterial* mat = g->matList.materials[m];
+        if (!Plausible(mat) || !Plausible(mat->texture)) continue;
+        char nb[33] = {};
+        std::strncpy(nb, mat->texture->name, 32);
+        for (char& ch : nb) ch = (char)std::tolower((unsigned char)ch);
+        if (std::strstr(nb, "screen") || std::strstr(nb, "scrn")) { best.mat = mat; best.info = nb; best.score = 0.01f; }
+      }
+    }
+  }
+  best.info = best.mat ? ("screen material '" + best.info + "'") : ("no screen material in: " + list);
+  return best;
+}
+
+void Restore(Swap& s)
+{
+  if (Plausible(s.mat) && s.mat->texture == s.ours) {
+    s.mat->texture = s.orig;
+    std::memcpy(s.mat->color, s.color, 4);
+  }
+  // our texture is kept (its refCount is high so nothing destroys it, and it never owns the video raster)
+  if (s.ours) s.ours->raster = nullptr;
+}
+} // namespace
+
+void luavideo::restore_screens_if_idle()
+{
+  for (size_t i = 0; i < g_swaps.size();) {
+    if (g_frame - g_swaps[i].lastFrame > 90) { Restore(g_swaps[i]); g_swaps.erase(g_swaps.begin() + i); }
+    else ++i;
+  }
 }
 
 namespace {
@@ -814,6 +1001,54 @@ void luavideo::reg(sol::state& state)
     return std::make_tuple(v ? v->frames : 0, v ? v->uploads : 0);
   };
   state["isRender3DAvailable"] = []() { return luavideo::available3d(); };
+  // 3.8.7-mp: draws queued / drawn by the 3D mesh path (the TV Player prints them)
+  state["getRender3DStats"] = []() { return std::make_tuple(g_stat3dDraws, g_stat3dOk, luavideo::available3d()); };
+  // 3.8.7-mp: the video on the TV model's own screen material.
+  //   setEntityScreenTexture(entityPtr, raster, {cx,cy,cz}, {nx,ny,nz}, width, height) -> ok, info
+  //   call it every frame with the newest frame; restoreEntityScreenTexture([entityPtr]) puts the TV's texture back
+  //   (also done by itself 90 frames after the last call)
+  state["setEntityScreenTexture"] = [](double entD, void* raster, sol::table c, sol::table nrm, float w, float h) {
+    const std::uintptr_t ent = (std::uintptr_t)entD;
+    if (!Plausible((void*)ent) || !raster || !g_texCreate) return std::make_tuple(false, std::string(g_texCreate ? "bad entity / texture" : "RwTextureCreate not found"));
+    for (auto& s : g_swaps) {
+      if (s.ent != ent) continue;
+      if (Plausible(s.mat) && s.mat->texture == s.ours && Plausible(reinterpret_cast<void*>(reinterpret_cast<CEntity*>(ent)->m_pRwObject))) {
+        s.ours->raster = static_cast<rw::RwRaster*>(raster);
+        s.lastFrame = g_frame;
+        return std::make_tuple(true, s.name);
+      }
+      // the model was streamed out / in again: look again
+      Restore(s);
+      s.mat = nullptr;
+    }
+    g_swaps.erase(std::remove_if(g_swaps.begin(), g_swaps.end(), [&](const Swap& s) { return s.ent == ent && !s.mat; }), g_swaps.end());
+    const float cc[3] = { c.get_or(1, 0.f), c.get_or(2, 0.f), c.get_or(3, 0.f) };
+    float nn[3] = { nrm.get_or(1, 0.f), nrm.get_or(2, -1.f), nrm.get_or(3, 0.f) };
+    const float nl = std::sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
+    if (nl > 0) for (float& x : nn) x /= nl;
+    Pick p = FindScreen(ent, cc, nn, w, h);
+    VLOG("screen texture: %s", p.info.c_str());
+    if (!p.mat) return std::make_tuple(false, p.info);
+    for (auto& s : g_swaps) // another TV of the same model already shows it
+      if (s.mat == p.mat) { s.ours->raster = static_cast<rw::RwRaster*>(raster); s.lastFrame = g_frame; return std::make_tuple(true, s.name); }
+    rw::RwTexture* ours = g_texCreate(static_cast<rw::RwRaster*>(raster));
+    if (!ours) return std::make_tuple(false, std::string("RwTextureCreate failed"));
+    ours->refCount += 100000;               // nothing may destroy it (it would destroy the video raster with it)
+    ours->filterAddressing = 0x3302;        // linear, clamp U / V
+    std::strncpy(ours->name, "mp_tvplayer", 31);
+    Swap s { ent, p.mat, p.mat->texture, ours, {}, g_frame, p.info };
+    std::memcpy(s.color, p.mat->color, 4);
+    p.mat->color[0] = p.mat->color[1] = p.mat->color[2] = p.mat->color[3] = 255; // a dark screen colour would darken the video
+    p.mat->texture = ours;
+    g_swaps.push_back(s);
+    return std::make_tuple(true, p.info);
+  };
+  state["restoreEntityScreenTexture"] = [](sol::optional<double> entD) {
+    for (size_t i = 0; i < g_swaps.size();) {
+      if (!entD || g_swaps[i].ent == (std::uintptr_t)*entD) { Restore(g_swaps[i]); g_swaps.erase(g_swaps.begin() + i); }
+      else ++i;
+    }
+  };
   state["renderDrawTexture3D"] = [](void* tex, sol::table verts, std::uint32_t argb, sol::optional<bool> depthTest) {
     if (!tex) return;
     const int n = (int)verts.size() / 5 / 3 * 3;

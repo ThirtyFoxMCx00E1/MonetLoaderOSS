@@ -23,7 +23,7 @@ else()
 endif()
 
 # ------ Project ------
-project(monetloader VERSION 3.8.6)
+project(monetloader VERSION 3.8.7)
 add_library(${PROJECT_NAME} SHARED)
 include_directories(${PROJECT_SOURCE_DIR}/cpp)
 include_directories(${PROJECT_SOURCE_DIR}/lib)

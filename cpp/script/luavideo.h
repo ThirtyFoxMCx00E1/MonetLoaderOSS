@@ -9,4 +9,5 @@ void set_hooked3d(bool on);      // the RenderEffects hook is in
 bool available3d();
 void frame_tick();               // CGame::Process: frees old rasters, drops last frame's draws
 void render3d();                 // RenderEffects: draws the queued meshes
+void restore_screens_if_idle();  // 3.8.7-mp: TV screen materials nobody updates any more get their texture back
 }
