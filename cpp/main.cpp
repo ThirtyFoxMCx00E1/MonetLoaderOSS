@@ -139,6 +139,9 @@ bool on_touch(int type, int num, int x, int y)
   }
 
   bool consumed = false;
+  if (mp_bridge::touch_feed()) {
+    return false; // 3.8.4: the scripts get this touch from MP (process_touch), already in the game's resolution
+  }
   lua::script_manager::for_each_event_handler("onTouch",
       [&consumed, type, num, x, y](sol::protected_function fn) -> std::optional<sol::error> {
         auto pfr = fn(type, num, x, y);
@@ -178,6 +181,24 @@ void process_touch()
   }
 
   g_touch_queue.clear();
+
+  // 3.8.4: onTouch from MP. MonetLoader's hook gave raw device pixels (the game renders below the screen's
+  // resolution on many phones) or nothing when the game calls AND_TouchEvent directly, so script buttons drawn with
+  // renderDraw* (tvplayer.lua's [TV]) could not be tapped. MP's touches are in getScreenResolution's space.
+  if (lua::script_manager::initialized()) {
+    int type, num, x, y;
+    while (mp_bridge::poll_touch(type, num, x, y)) {
+      lua::script_manager::for_each_event_handler("onTouch",
+          [type, num, x, y](sol::protected_function fn) -> std::optional<sol::error> {
+            auto pfr = fn(type, num, x, y);
+            if (!pfr.valid()) {
+              sol::error e = pfr;
+              return e;
+            }
+            return std::nullopt;
+          });
+    }
+  }
 }
 
 // ------ Script Processing ------

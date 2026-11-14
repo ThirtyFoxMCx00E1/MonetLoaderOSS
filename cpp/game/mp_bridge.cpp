@@ -21,6 +21,7 @@
 
 namespace {
 MpLuaBridge* g_mp;
+int (*g_poll_touch)(int*, int*, int*, int*);
 bool g_given_up;
 int g_tries;
 bool g_was_connected;
@@ -340,6 +341,7 @@ MpLuaBridge* find_mp()
     return nullptr;
   }
   auto get = reinterpret_cast<void* (*)()>(dlsym(h, "MP_GetLuaBridge"));
+  g_poll_touch = reinterpret_cast<int (*)(int*, int*, int*, int*)>(dlsym(h, "MP_PollScriptTouch")); // MP 4.13.38+
   dlclose(h); // NOLOAD handle: MP stays loaded
   if (!get) {
     return nullptr;
@@ -417,6 +419,16 @@ void sync_players()
     }
   }
 }
+}
+
+bool mp_bridge::touch_feed()
+{
+  return g_mp != nullptr && g_poll_touch != nullptr;
+}
+
+bool mp_bridge::poll_touch(int& type, int& num, int& x, int& y)
+{
+  return touch_feed() && g_poll_touch(&type, &num, &x, &y) != 0;
 }
 
 bool mp_bridge::active()
