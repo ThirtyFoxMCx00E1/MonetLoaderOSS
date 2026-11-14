@@ -32,16 +32,17 @@ class custom_level_formatter : public spdlog::custom_flag_formatter {
 
 void logger::init()
 {
-  if (!std::filesystem::exists(file_manager::external_storage)) {
+  std::error_code ec;
+  if (!std::filesystem::exists(file_manager::mp_moonloader_path().parent_path(), ec)) {
     return;
   }
 
   // MP Multiplayer: files/TYFMC/MP/moonloader/moonloader.log (next to the scripts, like PC MoonLoader)
   auto rel_file_path = std::filesystem::path{ "files" } / "TYFMC" / "MP" / "moonloader" / "moonloader.log";
-  auto file_path = file_manager::external_storage / rel_file_path;
+  auto file_path = file_manager::mp_moonloader_path() / "moonloader.log";
   relative_path = rel_file_path.parent_path();
   absolute_path = file_path.parent_path();
-  std::filesystem::create_directories(absolute_path);
+  std::filesystem::create_directories(absolute_path, ec);
 
   auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(file_path, true);
   file_sink->set_level(spdlog::level::trace);

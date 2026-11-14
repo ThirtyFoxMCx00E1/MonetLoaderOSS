@@ -1,3 +1,5 @@
+#include <android/log.h>
+#include <exception>
 #include "aml_stuff.h"
 #include "bass_manager.h"
 #include "compat.h"
@@ -291,7 +293,18 @@ void* h_netgame_ctor(char* self, const char* address, int port, const char* nick
 #endif
 
 // ------ Init ------
+static void do_init_body();
 void do_init()
+{
+  try {
+    do_init_body();
+  } catch (const std::exception& e) {
+    __android_log_print(ANDROID_LOG_ERROR, "MonetLoader", "init failed: %s", e.what());
+  } catch (...) {
+    __android_log_print(ANDROID_LOG_ERROR, "MonetLoader", "init failed");
+  }
+}
+static void do_init_body()
 {
   void* handle = dlopen(compat::gtasa_name.c_str(), RTLD_LAZY);
   monethook::plt_scanner scanner { lib_manager::gtasa_base, lib_manager::gtasa_path.c_str() };
@@ -494,11 +507,20 @@ void init_thread()
 
 void do_preinit()
 {
-  andutils::init();
-  file_manager::init();
-  bass_manager::init();
-  logger::init();
-  compat::init();
+  // MP: nothing in startup may throw out into the game (an uncaught C++ exception = the game closes with no crash log)
+  try {
+    andutils::init();
+    file_manager::init();
+    bass_manager::init();
+    logger::init();
+    compat::init();
+  } catch (const std::exception& e) {
+    __android_log_print(ANDROID_LOG_ERROR, "MonetLoader", "preinit failed: %s", e.what());
+    return;
+  } catch (...) {
+    __android_log_print(ANDROID_LOG_ERROR, "MonetLoader", "preinit failed");
+    return;
+  }
 
   if (!check_libs_loaded())
     std::thread { init_thread }.detach(); // Do async loading

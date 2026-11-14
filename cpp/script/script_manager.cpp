@@ -272,14 +272,20 @@ void lua::script_manager::one_off_load(std::filesystem::path path)
 void lua::script_manager::load_all()
 {
   std::filesystem::path path { _root_path };
-  std::filesystem::create_directories(path);
-  std::filesystem::create_directories(path / "lib");
-  std::filesystem::create_directories(path / "config");
+  std::error_code ec;
+  std::filesystem::create_directories(path, ec);
+  std::filesystem::create_directories(path / "lib", ec);
+  std::filesystem::create_directories(path / "config", ec);
 
   std::string ext_lua { ".lua" };
   std::string ext_luac { ".luac" };
-  for (auto& i : std::filesystem::directory_iterator(path)) {
-    if (i.is_regular_file() && (i.path().extension() == ext_lua || i.path().extension() == ext_luac)) {
+  std::filesystem::directory_iterator it { path, ec };
+  if (ec) {
+    return;   // MP: no readable moonloader folder = no scripts (never throw into the game)
+  }
+  for (auto& i : it) {
+    std::error_code fe;
+    if (i.is_regular_file(fe) && (i.path().extension() == ext_lua || i.path().extension() == ext_luac)) {
       load(i.path());
     }
   }

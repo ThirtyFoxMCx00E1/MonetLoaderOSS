@@ -43,7 +43,7 @@ void set_default_profile(rapidjson::Document& doc)
 
 void compat::init()
 {
-  std::filesystem::path path = file_manager::public_external_storage / "monetloader/compat/profile.json";
+  std::filesystem::path path = file_manager::mp_moonloader_path() / "config" / "monetloader_compat.json";
 
   // set default profile
 
@@ -52,9 +52,10 @@ void compat::init()
 
   // try to load user profile
 
-  if (!std::filesystem::exists(path)) {
+  std::error_code ec;
+  if (!std::filesystem::exists(path, ec)) {
     // if profile does not exists, write default one
-    std::filesystem::create_directories(path.parent_path());
+    std::filesystem::create_directories(path.parent_path(), ec);
 
     std::ofstream f { path };
     if (f) {
