@@ -21,9 +21,18 @@ void set_scissor_rect(CRect& rect)
   return ((void (*)(CRect&))lib_manager::set_scissor)(rect);
 }
 
-imrw::image_data create_image_from_rgba8888(stbi_uc* pxs, int iw, int ih, bool is_stb_image = true)
+// 3.8.9-mp: mipmaps = true makes a raster with mip levels (RenderWare builds them on unlock). The game's 3D pipelines
+// sample world textures with mipmap filtering, and on OpenGL ES a texture without its mip levels is "incomplete" and
+// reads as pure black there - the TV Player's frames showed in 2D (no mipmaps needed) but black on the TV.
+imrw::image_data create_image_from_rgba8888(stbi_uc* pxs, int iw, int ih, bool is_stb_image = true, bool mipmaps = false)
 {
-  rw::RwRaster* raster = rw::RwRasterCreate(iw, ih, 32,
+  const bool pot = iw > 0 && ih > 0 && (iw & (iw - 1)) == 0 && (ih & (ih - 1)) == 0;
+  rw::RwRaster* raster = nullptr;
+  if (mipmaps && pot)
+    raster = rw::RwRasterCreate(iw, ih, 32, static_cast<std::int32_t>(rw::rwRASTERFORMAT8888) | rw::rwRASTERTYPETEXTURE |
+                                                static_cast<std::int32_t>(rw::rwRASTERFORMATMIPMAP) | static_cast<std::int32_t>(rw::rwRASTERFORMATAUTOMIPMAP));
+  if (!raster)
+    raster = rw::RwRasterCreate(iw, ih, 32,
       static_cast<std::int32_t>(rw::rwRASTERFORMAT8888) | rw::rwRASTERTYPETEXTURE);
   if (!raster) {
     if (is_stb_image) {
@@ -262,7 +271,7 @@ void imrw::new_frame()
   r->time = current_time;
 }
 
-imrw::image_data imrw::load_image(const char* file)
+imrw::image_data imrw::load_image(const char* file, bool mipmaps)
 {
   // rw::RwImage* image = rw::RtPNGImageRead(path);
   // if (!image) {
@@ -286,7 +295,7 @@ imrw::image_data imrw::load_image(const char* file)
     return { nullptr, 0, 0 };
   }
 
-  return create_image_from_rgba8888(pxs, iw, ih);
+  return create_image_from_rgba8888(pxs, iw, ih, true, mipmaps);
 }
 
 imrw::image_data imrw::load_image_from_memory(const unsigned char* data, int length)

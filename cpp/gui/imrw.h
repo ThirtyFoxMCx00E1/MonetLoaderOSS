@@ -17,7 +17,7 @@ struct image_data {
   float height;
 };
 
-image_data load_image(const char* path);
+image_data load_image(const char* path, bool mipmaps = false);
 image_data load_image_from_memory(const unsigned char* data, int length);
 image_data get_image_data(ImTextureID raster);
 void destroy_image(ImTextureID raster);

@@ -988,8 +988,9 @@ void luafuncs::reg(sol::state& state)
     gui::render::draw_polygon(posX, posY, sizeX, sizeY, corners, rotation, color);
   };
 
-  state["renderLoadTextureFromFile"] = [](const char* file) {
-    return imrw::load_image(file).raster;
+  // 3.8.9-mp: renderLoadTextureFromFile(file[, mipmaps]) - mipmaps = true for textures drawn in the 3D world
+  state["renderLoadTextureFromFile"] = [](const char* file, sol::optional<bool> mipmaps) {
+    return imrw::load_image(file, mipmaps.value_or(false)).raster;
   };
   state["renderLoadTextureFromFileInMemory"] = [](std::uintptr_t ptr, int len) {
     return imrw::load_image_from_memory(reinterpret_cast<unsigned char*>(ptr), len).raster;

@@ -595,7 +595,9 @@ rw::RwRaster* RasterViaImage(Video& v)
     if (!said) { said = true; VLOG("RwImageFindRasterFormat %dx%d != %dx%d", rw_, rh, v.tw, v.th); }
     return nullptr;
   }
-  rw::RwRaster* r = rw::RwRasterCreate(rw_, rh, rd, rf);
+  // 3.8.9-mp: with mip levels (RenderWare makes them), else the game's mipmapped 3D sampling reads the frame as black
+  rw::RwRaster* r = rw::RwRasterCreate(rw_, rh, rd, rf | static_cast<int>(rw::rwRASTERFORMATMIPMAP) | static_cast<int>(rw::rwRASTERFORMATAUTOMIPMAP));
+  if (!r) r = rw::RwRasterCreate(rw_, rh, rd, rf);
   if (r) r = g_rasFromImage(r, g_img);
   return r;
 }
@@ -612,7 +614,9 @@ void* Texture(Video& v)
     if (g_texMode != 1) { g_texMode = 1; VLOG("textures: RwImage + RwRasterSetFromImage (%dx%d)", v.tw, v.th); }
   } else {
     // fallback: lock / unlock a new raster (MonetLoader's own image loader)
-    r = rw::RwRasterCreate(v.tw, v.th, 32, static_cast<std::int32_t>(rw::rwRASTERFORMAT8888) | rw::rwRASTERTYPETEXTURE);
+    r = rw::RwRasterCreate(v.tw, v.th, 32, static_cast<std::int32_t>(rw::rwRASTERFORMAT8888) | rw::rwRASTERTYPETEXTURE |
+                           static_cast<std::int32_t>(rw::rwRASTERFORMATMIPMAP) | static_cast<std::int32_t>(rw::rwRASTERFORMATAUTOMIPMAP));
+    if (!r) r = rw::RwRasterCreate(v.tw, v.th, 32, static_cast<std::int32_t>(rw::rwRASTERFORMAT8888) | rw::rwRASTERTYPETEXTURE);
     if (!r)
       return v.raster;
     std::uint8_t* locked = rw::RwRasterLock(r, 0, rw::rwRASTERLOCKWRITE | rw::rwRASTERLOCKNOFETCH);
@@ -663,6 +667,8 @@ rw::RwTexture* (*g_texCreate)(rw::RwRaster*) = nullptr;
 void* (*g_clumpForAll)(void*, void* (*)(void*, void*), void*) = nullptr;
 void* (*g_geoLock)(void*, int) = nullptr;   // 3.8.8-mp: RpGeometryLock / Unlock make the game build the TV mesh again
 void* (*g_geoUnlock)(void*) = nullptr;
+void (*g_freeResEntry)(void*) = nullptr;      // 3.8.9-mp: RwResourcesFreeResEntry - drop the cached GPU copy of the TV mesh
+int* g_dnOffset = nullptr;                    // 3.8.9-mp: CCustomBuildingDNPipeline::ms_extraVertColourPluginOffset
 } // namespace
 
 void luavideo::init3d(void* gtasa)
@@ -682,6 +688,10 @@ void luavideo::init3d(void* gtasa)
   *(void**)&g_clumpForAll = dlsym(gtasa, "_Z20RpClumpForAllAtomicsP7RpClumpPFP8RpAtomicS2_PvES3_");
   *(void**)&g_geoLock = dlsym(gtasa, "_Z14RpGeometryLockP10RpGeometryi");
   *(void**)&g_geoUnlock = dlsym(gtasa, "_Z16RpGeometryUnlockP10RpGeometry");
+  *(void**)&g_freeResEntry = dlsym(gtasa, "_Z23RwResourcesFreeResEntryP10RwResEntry");
+  g_dnOffset = static_cast<int*>(dlsym(gtasa, "_ZN25CCustomBuildingDNPipeline30ms_extraVertColourPluginOffsetE"));
+  VLOG("TV screen: RpGeometryLock %p, RwResourcesFreeResEntry %p, DN colour offset %d", (void*)g_geoLock, (void*)g_freeResEntry,
+       g_dnOffset ? *g_dnOffset : -1);
   VLOG("Im3D: transform %p, render %p / %p, end %p", (void*)g_im3dTransform, (void*)g_im3dRenderPrim, (void*)g_im3dRenderIdx, (void*)g_im3dEnd);
 }
 
@@ -827,6 +837,8 @@ struct Swap {
   std::vector<int> vidx;
   std::vector<float> ouv;
   std::vector<std::uint32_t> ocol;
+  std::vector<std::uint32_t> onight, oday;   // 3.8.9-mp: the day / night building colours (map TVs use the DN pipeline)
+  std::vector<XRpAtomic*> atomics;           // their cached GPU copies are dropped too
 };
 std::vector<Swap> g_swaps;
 
@@ -849,9 +861,13 @@ std::vector<XRpAtomic*> Atomics(std::uintptr_t ent)
 struct Pick { XRpMaterial* mat = nullptr; XRpGeometry* geo = nullptr; int matIdx = -1; float score = 0; std::string info; };
 
 // c = screen centre, n = screen normal, w / h = screen size (model space)
-Pick FindScreen(std::uintptr_t ent, const float c[3], const float n[3], float w, float h)
+// 3.8.9-mp: pts = the screen's own vertex positions from tvplayer/screens.lua (made from the game's TV models): the
+// material whose triangles sit on those exact points is the screen. The plane test below is the fallback, and it now
+// also takes a material that is mostly (not only) on the screen.
+Pick FindScreen(std::uintptr_t ent, const float c[3], const float n[3], float w, float h, const std::vector<float>& pts = {})
 {
-  Pick best;
+  Pick best, loose, exact;
+  int exactTris = 0;
   std::string list;
   for (XRpAtomic* a : Atomics(ent)) {
     XRpGeometry* g = Plausible(a) ? a->geometry : nullptr;
@@ -867,7 +883,7 @@ Pick FindScreen(std::uintptr_t ent, const float c[3], const float n[3], float w,
       const char* tn = Plausible(mat->texture) ? mat->texture->name : "";
       char nameBuf[33] = {};
       std::strncpy(nameBuf, tn, 32);
-      int tris = 0, inside = 0;
+      int tris = 0, inside = 0, onPts = 0;
       float area = 0, umin = 1e9f, umax = -1e9f, vmin = 1e9f, vmax = -1e9f;
       if (hasTris) {
         const float* V = g->morphTarget[0].verts;
@@ -891,6 +907,15 @@ Pick FindScreen(std::uintptr_t ent, const float c[3], const float n[3], float w,
               umin = std::min(umin, u); umax = std::max(umax, u); vmin = std::min(vmin, vv); vmax = std::max(vmax, vv);
             }
           }
+          if (!pts.empty()) {
+            int hit = 0;
+            for (int k = 0; k < 3; ++k)
+              for (size_t q = 0; q + 2 < pts.size(); q += 3) {
+                const float ex = p[k][0] - pts[q], ey = p[k][1] - pts[q + 1], ez = p[k][2] - pts[q + 2];
+                if (ex * ex + ey * ey + ez * ez < 0.012f * 0.012f) { ++hit; break; }
+              }
+            if (hit == 3) ++onPts;
+          }
           if (!in) continue;
           ++inside;
           const float ax = p[1][0] - p[0][0], ay = p[1][1] - p[0][1], az = p[1][2] - p[0][2];
@@ -900,8 +925,8 @@ Pick FindScreen(std::uintptr_t ent, const float c[3], const float n[3], float w,
         }
       }
       char line[160];
-      std::snprintf(line, sizeof line, "%s%s(%d tris, %d on screen, %.0f%% area, uv %.2f-%.2f/%.2f-%.2f)", list.empty() ? "" : ", ",
-                    nameBuf[0] ? nameBuf : "-", tris, inside, w * h > 0 ? 100.f * area / (w * h) : 0.f,
+      std::snprintf(line, sizeof line, "%s#%d %s(%d tris, %d on screen, %d on screens.lua, %.0f%% area, uv %.2f-%.2f/%.2f-%.2f)", list.empty() ? "" : ", ",
+                    m, nameBuf[0] ? nameBuf : "-", tris, inside, onPts, w * h > 0 ? 100.f * area / (w * h) : 0.f,
                     umin < 1e8f ? umin : 0.f, umax > -1e8f ? umax : 0.f, vmin < 1e8f ? vmin : 0.f, vmax > -1e8f ? vmax : 0.f);
       list += line;
       if (!hasTris || tris == 0) continue;
@@ -914,8 +939,18 @@ Pick FindScreen(std::uintptr_t ent, const float c[3], const float n[3], float w,
         best.score = cover;
         best.info = nameBuf;
       }
+      // most of its triangles are the screens.lua triangles (the screen material can also cover the TV's sides)
+      if (onPts >= 2 && onPts * 2 >= tris && onPts > exactTris) {
+        exact.mat = mat; exact.geo = g; exact.matIdx = m; exact.score = 1; exact.info = std::string(nameBuf[0] ? nameBuf : "-") + ", matched screens.lua";
+        exactTris = onPts;
+      }
+      if (inside * 2 >= tris && cover > 0.2f && cover > loose.score) {
+        loose.mat = mat; loose.geo = g; loose.matIdx = m; loose.score = cover; loose.info = std::string(nameBuf[0] ? nameBuf : "-") + ", mostly on the screen";
+      }
     }
   }
+  if (exact.mat) best = exact;
+  else if (!best.mat && loose.mat) best = loose;
   if (!best.mat) {
     // no triangle data in memory: a material named like a screen
     for (XRpAtomic* a : Atomics(ent)) {
@@ -935,10 +970,27 @@ Pick FindScreen(std::uintptr_t ent, const float c[3], const float n[3], float w,
   return best;
 }
 
-void Reinstance(XRpGeometry* g)
+// 3.8.9-mp: map objects (the TV in CJ's house) are drawn by the day / night building pipeline. It does not use the
+// geometry's prelit colours but two own arrays (night, day) from a geometry plugin, so a black night colour on the glass
+// kept the screen black whatever the texture was.
+struct XDNColours { std::uint32_t* night; std::uint32_t* day; float param; };
+XDNColours* DNColours(XRpGeometry* g)
+{
+  if (!g_dnOffset || *g_dnOffset <= 0 || *g_dnOffset > 4096 || !Plausible(g)) return nullptr;
+  auto* d = reinterpret_cast<XDNColours*>(reinterpret_cast<std::uint8_t*>(g) + *g_dnOffset);
+  return (Plausible(d->night) || Plausible(d->day)) ? d : nullptr;
+}
+
+void Reinstance(XRpGeometry* g, const std::vector<XRpAtomic*>& atomics)
 {
   // the phone keeps a ready-made copy of the mesh for the GPU: lock + unlock = build it again from the changed arrays
   if (g_geoLock && g_geoUnlock && Plausible(g)) { g_geoLock(g, 0x18 /* PRELIGHT | TEXCOORDS */); g_geoUnlock(g); }
+  // 3.8.9-mp: the mobile pipelines do not always look at the lock flags, and their shader was chosen for the old
+  // material (no texture on some TV glass): drop the cached copy, the next draw builds it from scratch
+  if (!g_freeResEntry || !Plausible(g)) return;
+  if (Plausible(g->repEntry)) g_freeResEntry(g->repEntry);
+  for (XRpAtomic* a : atomics)
+    if (Plausible(a) && a->geometry == g && Plausible(a->repEntry)) g_freeResEntry(a->repEntry);
 }
 
 // 3.8.8-mp: many TV models map their screen to a few texels of a shared texture (or have black vertex colours
@@ -972,16 +1024,37 @@ std::string Remap(Swap& s, XRpGeometry* g, int m, const float ax[9])
     uv[i * 2 + 1] = std::min(1.f, std::max(0.f, v));
     if (col) col[i] = 0xFFFFFFFFu;
   }
+  XDNColours* dn = DNColours(g);
+  if (dn)
+    for (int i : s.vidx) {
+      s.onight.push_back(Plausible(dn->night) ? dn->night[i] : 0); s.oday.push_back(Plausible(dn->day) ? dn->day[i] : 0);
+      if (Plausible(dn->night)) dn->night[i] = 0xFFFFFFFFu;
+      if (Plausible(dn->day)) dn->day[i] = 0xFFFFFFFFu;
+    }
   s.geo = g;
-  Reinstance(g);
-  char buf[96];
-  std::snprintf(buf, sizeof buf, "%d vertices remapped%s%s", (int)s.vidx.size(), col ? ", white" : "", g_geoLock ? "" : ", no RpGeometryLock");
+  Reinstance(g, s.atomics);
+  char buf[128];
+  std::snprintf(buf, sizeof buf, "%d vertices remapped%s%s%s", (int)s.vidx.size(), col ? ", white" : "", dn ? ", day+night white" : "",
+                g_freeResEntry ? ", rebuilt" : (g_geoLock ? "" : ", no RpGeometryLock"));
   return buf;
+}
+
+// 3.8.9-mp: the geometry is only touched while the entity still uses it (a TV streamed out frees its model)
+bool GeoAlive(const Swap& s)
+{
+  if (!Plausible(s.geo) || !Plausible((void*)s.ent)) return false;
+  for (XRpAtomic* a : Atomics(s.ent)) if (Plausible(a) && a->geometry == s.geo) return true;
+  return false;
 }
 
 void Restore(Swap& s)
 {
-  if (Plausible(s.geo) && !s.vidx.empty() && Plausible(s.geo->texCoords[0])) {
+  const bool alive = GeoAlive(s);
+  if (alive && Plausible(s.mat) && s.mat->texture == s.ours) {   // texture first, so the rebuilt mesh has the TV's own
+    s.mat->texture = s.orig;
+    std::memcpy(s.mat->color, s.color, 4);
+  }
+  if (alive && !s.vidx.empty() && Plausible(s.geo->texCoords[0])) {
     float* uv = s.geo->texCoords[0];
     std::uint32_t* col = ((s.geo->flags & 0x8) && Plausible(s.geo->preLit)) ? static_cast<std::uint32_t*>(s.geo->preLit) : nullptr;
     for (size_t k = 0; k < s.vidx.size(); ++k) {
@@ -990,13 +1063,14 @@ void Restore(Swap& s)
       uv[i * 2] = s.ouv[k * 2]; uv[i * 2 + 1] = s.ouv[k * 2 + 1];
       if (col) col[i] = s.ocol[k];
     }
-    Reinstance(s.geo);
+    if (XDNColours* dn = DNColours(s.geo))
+      for (size_t k = 0; k < s.vidx.size() && k < s.onight.size(); ++k) {
+        if (Plausible(dn->night)) dn->night[s.vidx[k]] = s.onight[k];
+        if (Plausible(dn->day)) dn->day[s.vidx[k]] = s.oday[k];
+      }
+    Reinstance(s.geo, s.atomics);
   }
-  s.vidx.clear(); s.ouv.clear(); s.ocol.clear(); s.geo = nullptr;
-  if (Plausible(s.mat) && s.mat->texture == s.ours) {
-    s.mat->texture = s.orig;
-    std::memcpy(s.mat->color, s.color, 4);
-  }
+  s.vidx.clear(); s.ouv.clear(); s.ocol.clear(); s.onight.clear(); s.oday.clear(); s.geo = nullptr;
   // our texture is kept (its refCount is high so nothing destroys it, and it never owns the video raster)
   if (s.ours) s.ours->raster = nullptr;
 }
@@ -1076,7 +1150,9 @@ void luavideo::reg(sol::state& state)
   //   (also done by itself 90 frames after the last call)
   //   3.8.8-mp: optional 7th argument axes = { ox,oy,oz, ux,uy,uz, vx,vy,vz } (uv (0,0) and the edges to (1,0) / (0,1)):
   //   the screen's own uv / vertex colours are replaced so the whole picture shows (put back on restore)
-  state["setEntityScreenTexture"] = [](double entD, void* raster, sol::table c, sol::table nrm, float w, float h, sol::optional<sol::table> axes) {
+  //   3.8.9-mp: optional 8th argument pts = { x,y,z, x,y,z, ... } the screen's vertex positions (model space)
+  state["setEntityScreenTexture"] = [](double entD, void* raster, sol::table c, sol::table nrm, float w, float h, sol::optional<sol::table> axes,
+                                       sol::optional<sol::table> ptsT) {
     const std::uintptr_t ent = (std::uintptr_t)entD;
     if (!Plausible((void*)ent) || !raster || !g_texCreate) return std::make_tuple(false, std::string(g_texCreate ? "bad entity / texture" : "RwTextureCreate not found"));
     for (auto& s : g_swaps) {
@@ -1095,7 +1171,9 @@ void luavideo::reg(sol::state& state)
     float nn[3] = { nrm.get_or(1, 0.f), nrm.get_or(2, -1.f), nrm.get_or(3, 0.f) };
     const float nl = std::sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
     if (nl > 0) for (float& x : nn) x /= nl;
-    Pick p = FindScreen(ent, cc, nn, w, h);
+    std::vector<float> pts;
+    if (ptsT) { const int np = (int)ptsT->size(); for (int i = 1; i <= np && i <= 3 * 512; ++i) pts.push_back(ptsT->get_or(i, 0.f)); }
+    Pick p = FindScreen(ent, cc, nn, w, h, pts);
     VLOG("screen texture: %s", p.info.c_str());
     if (!p.mat) return std::make_tuple(false, p.info);
     for (auto& s : g_swaps) // another TV of the same model already shows it
@@ -1105,16 +1183,24 @@ void luavideo::reg(sol::state& state)
     ours->refCount += 100000;               // nothing may destroy it (it would destroy the video raster with it)
     ours->filterAddressing = 0x3302;        // linear, clamp U / V
     std::strncpy(ours->name, "mp_tvplayer", 31);
-    Swap s { ent, p.mat, p.mat->texture, ours, {}, g_frame, p.info, nullptr, {}, {}, {} };
+    Swap s { ent, p.mat, p.mat->texture, ours, {}, g_frame, p.info, nullptr, {}, {}, {}, {}, {}, Atomics(ent) };
     std::memcpy(s.color, p.mat->color, 4);
+    // 3.8.9-mp: texture + colour before the remap, so the rebuilt GPU mesh is made with the video's material
+    p.mat->color[0] = p.mat->color[1] = p.mat->color[2] = p.mat->color[3] = 255; // a dark screen colour would darken the video
+    p.mat->texture = ours;
     if (axes && p.geo && p.matIdx >= 0) {
       float ax[9];
       for (int i = 0; i < 9; ++i) ax[i] = axes->get_or(i + 1, 0.f);
-      s.name += " (" + Remap(s, p.geo, p.matIdx, ax) + ")";
+      const std::string r = Remap(s, p.geo, p.matIdx, ax);
+      if (r == "no uv" || r == "no mesh data" || r == "bad axes") {
+        // 3.8.9-mp: no texture coordinates on the glass = no picture can ever show there: the script uses the 3D mesh
+        p.mat->texture = s.orig;
+        std::memcpy(p.mat->color, s.color, 4);
+        return std::make_tuple(false, p.info + " (" + r + ")");
+      }
+      s.name += " (" + r + ")";
     }
     VLOG("screen texture: %s", s.name.c_str());
-    p.mat->color[0] = p.mat->color[1] = p.mat->color[2] = p.mat->color[3] = 255; // a dark screen colour would darken the video
-    p.mat->texture = ours;
     g_swaps.push_back(s);
     return std::make_tuple(true, s.name);
   };
