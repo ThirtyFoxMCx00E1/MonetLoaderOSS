@@ -14,29 +14,29 @@
 namespace {
 void set_default_profile(rapidjson::Document& doc)
 {
-  doc["gtasa_name"].SetString("libGTASA.so", doc.GetAllocator());
-  doc["compat_scripts"].SetArray();
-
+  // MP: the document must be an object before members are added. The old code wrote doc["key"] on an empty
+  // (null) document: rapidjson has no such member, so nothing was stored, the profile was "invalid", and
+  // gtasa_name = doc["gtasa_name"].GetString() read a null string -> SIGSEGV in strlen on the first start.
+  doc.SetObject();
+  auto& a = doc.GetAllocator();
+  doc.AddMember("gtasa_name", rapidjson::Value("libGTASA.so", a), a);
+  doc.AddMember("compat_scripts", rapidjson::Value(rapidjson::kArrayType), a);
 #if INTPTR_MAX == INT64_MAX
-  doc["profile_name"].SetString("default GTA:2.1 SAMP:NULL", doc.GetAllocator());
-  doc["samp_name"] = "";
-  doc["receiveignorerpc_pattern"] = "";
-  doc["cnetgame_ctor_pattern"] = "";
-  doc["rakclientinterface_netgame_offset"] = 0;
-  doc["use_samp_touch_workaround"] = false;
-  doc["nveventinsertnewest_offset"] = 0x0;
+  doc.AddMember("profile_name", rapidjson::Value("default GTA:2.1 SAMP:NULL", a), a);
+  doc.AddMember("samp_name", rapidjson::Value("", a), a);
+  doc.AddMember("receiveignorerpc_pattern", rapidjson::Value("", a), a);
+  doc.AddMember("cnetgame_ctor_pattern", rapidjson::Value("", a), a);
+  doc.AddMember("rakclientinterface_netgame_offset", 0, a);
+  doc.AddMember("use_samp_touch_workaround", false, a);
+  doc.AddMember("nveventinsertnewest_offset", 0, a);
 #else
-  doc["profile_name"].SetString("default GTA:2.0 SAMP:ARZ-15.0.8", doc.GetAllocator());
-  doc["samp_name"].SetString("libsamp.so", doc.GetAllocator());
-  doc["receiveignorerpc_pattern"].SetString(
-      "F0B503AF2DE900????B004460068C16A20468847",
-      doc.GetAllocator());
-  doc["cnetgame_ctor_pattern"].SetString(
-      "F0B503AF2DE9000788B00D46????9146????0446002079447A44",
-      doc.GetAllocator());
-  doc["rakclientinterface_netgame_offset"] = 528;
-  doc["use_samp_touch_workaround"] = true;
-  doc["nveventinsertnewest_offset"] = 0x27C4F0;
+  doc.AddMember("profile_name", rapidjson::Value("default GTA:2.0 SAMP:ARZ-15.0.8", a), a);
+  doc.AddMember("samp_name", rapidjson::Value("libsamp.so", a), a);
+  doc.AddMember("receiveignorerpc_pattern", rapidjson::Value("F0B503AF2DE900????B004460068C16A20468847", a), a);
+  doc.AddMember("cnetgame_ctor_pattern", rapidjson::Value("F0B503AF2DE9000788B00D46????9146????0446002079447A44", a), a);
+  doc.AddMember("rakclientinterface_netgame_offset", 528, a);
+  doc.AddMember("use_samp_touch_workaround", true, a);
+  doc.AddMember("nveventinsertnewest_offset", 0x27C4F0, a);
 #endif
 }
 }
@@ -101,7 +101,7 @@ void compat::init()
   const char* s_use_samp_touch_workaround = "use_samp_touch_workaround";
   const char* s_nveventinsertnewest_offset = "nveventinsertnewest_offset";
 
-  if (!doc.HasMember(s_gtasa_name) || !doc[s_gtasa_name].IsString()
+  if (!doc.IsObject() || !doc.HasMember(s_gtasa_name) || !doc[s_gtasa_name].IsString()
       || !doc.HasMember(s_compat_scripts) || !doc[s_compat_scripts].IsArray()
       || !doc.HasMember(s_profile_name) || !doc[s_profile_name].IsString()
       || !doc.HasMember(s_samp_name) || !doc[s_samp_name].IsString()
