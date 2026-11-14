@@ -1,3 +1,4 @@
+#include "luavideo.h"
 #include "game/mp_bridge.h"
 #include "game/rakhook.h"
 #include "script_manager.h"
@@ -1248,6 +1249,7 @@ void lua::script_manager::register_cleo_opcodes(script& s)
   };
 
   luabass::reg(state);
+  luavideo::reg(state); // 3.8.2-mp: tvplayer.lua
 }
 
 void lua::script_manager::register_sampfuncs_opcodes(script& s)

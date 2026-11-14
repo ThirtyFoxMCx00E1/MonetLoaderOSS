@@ -78,6 +78,7 @@ target_sources(${PROJECT_NAME} PRIVATE
     cpp/script/luabass.cpp
     cpp/script/luajson.cpp
     cpp/script/luafuncs.cpp
+    cpp/script/luavideo.cpp
     cpp/script/opcodes.cpp
     cpp/script/scheduler.cpp
     cpp/script/script_manager.cpp

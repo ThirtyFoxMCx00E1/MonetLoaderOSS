@@ -23,7 +23,7 @@ else()
 endif()
 
 # ------ Project ------
-project(monetloader VERSION 3.8.1)
+project(monetloader VERSION 3.8.2)
 add_library(${PROJECT_NAME} SHARED)
 include_directories(${PROJECT_SOURCE_DIR}/cpp)
 include_directories(${PROJECT_SOURCE_DIR}/lib)
@@ -33,6 +33,7 @@ include_directories(${PROJECT_SOURCE_DIR}/lib/lua)
 # spdlog
 add_subdirectory(lib/spdlog)
 target_link_libraries(${PROJECT_NAME} PRIVATE spdlog::spdlog)
+target_link_libraries(${PROJECT_NAME} PRIVATE mediandk OpenSLES) # 3.8.2-mp: luavideo
 
 # LuaJIT
 set(LUAJIT_SHARED OFF) # MP: static, so AML loads one .so with no extra DT_NEEDED
