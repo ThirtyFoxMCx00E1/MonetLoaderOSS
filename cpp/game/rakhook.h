@@ -10,6 +10,19 @@ void init(RakClientInterface* rci, std::uintptr_t recv_ignore_rpc);
 bool available();
 void process();
 
+// MP Multiplayer (TYFMC MP): no SA-MP client, MP feeds SA-MP style RPCs through the same Lua path
+namespace mp {
+  using out_rpc_fn = void (*)(int id, RakNet::BitStream* bs);
+  using out_packet_fn = void (*)(RakNet::BitStream* bs);
+  using apply_rpc_fn = void (*)(std::uint8_t id, RakNet::BitStream* bs);
+  void init(out_rpc_fn out_rpc, out_packet_fn out_packet, apply_rpc_fn apply_rpc);
+  bool active();
+  // Lua onReceiveRpc/onReceivePacket + netinfo. false = a script blocked it; *out gets the (maybe edited) RPC body
+  bool incoming_rpc(std::uint8_t id, RakNet::BitStream* bs, RakNet::BitStream* out);
+  bool incoming_packet(RakNet::BitStream* bs);
+  void pump(); // emulated RPCs (sampAddChatMessage, sampShowDialog, ...) -> MP
+}
+
 namespace emu {
   void clear();
   void only(bool toggle);

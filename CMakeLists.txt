@@ -35,7 +35,7 @@ add_subdirectory(lib/spdlog)
 target_link_libraries(${PROJECT_NAME} PRIVATE spdlog::spdlog)
 
 # LuaJIT
-set(LUAJIT_SHARED ON)
+set(LUAJIT_SHARED OFF) # MP: static, so AML loads one .so with no extra DT_NEEDED
 
 if(LUAJIT_SHARED)
     set(LUAJIT_SUFFIX .so)
@@ -76,7 +76,7 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE "NEW_INPUT_SYSTEM=1")
 if(SAMP_MODE EQUAL 0)
     target_compile_definitions(${PROJECT_NAME} PRIVATE "PROJECT_VERSION=\"${PROJECT_VERSION}-sa\"")
 elseif(SAMP_MODE EQUAL 1)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE "PROJECT_VERSION=\"${PROJECT_VERSION}-os\"")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE "PROJECT_VERSION=\"${PROJECT_VERSION}-mp\"")
 elseif(SAMP_MODE EQUAL 2)
     target_compile_definitions(${PROJECT_NAME} PRIVATE "PROJECT_VERSION=\"${PROJECT_VERSION}-rs\"")
 endif()

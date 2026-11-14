@@ -1,3 +1,4 @@
+#include "game/rakhook.h"
 #include "script_manager.h"
 #include "clipboard.h"
 #include "compat.h"
@@ -137,11 +138,10 @@ void lua::script_manager::init()
 
   logger::log<logger::LV_SYSTEM>(nullptr, "{}", "\n\n\n\t* MonetLoader initialized! Version: " PROJECT_VERSION "\n\t* Official Telegram: t.me/MonetLoader\n\n");
 
-  // migrate from legacy storage (Android/data/monetloader one)
-  std::filesystem::path monetloader_path = file_manager::public_external_storage / "monetloader";
-  if (move_recursive(file_manager::external_storage / "monetloader", monetloader_path)) {
-    logger::log<logger::LV_SYSTEM>(nullptr, "{}", "Migrated to new storage under Android/media from Android/data.");
-  }
+  // MP Multiplayer: PC MoonLoader scripts live in the MP folder (files/TYFMC/MP/moonloader, lib/ for the libraries)
+  std::filesystem::path monetloader_path = file_manager::mp_moonloader_path();
+  std::error_code ec;
+  std::filesystem::create_directories(monetloader_path / "lib", ec);
 
   // setup
   _main_thread_id = gettid();
@@ -936,10 +936,10 @@ void lua::script_manager::register_opcode_extensions(script& s)
     return true;
   };
   state["isSampfuncsLoaded"] = []() {
-    return lib_manager::samp_base != 0;
+    return lib_manager::samp_base != 0 || rakhook::mp::active();
   };
   state["isSampLoaded"] = []() {
-    return lib_manager::samp_base != 0;
+    return lib_manager::samp_base != 0 || rakhook::mp::active();
   };
 
   state["getCharQuaternion"] = [](int self) {

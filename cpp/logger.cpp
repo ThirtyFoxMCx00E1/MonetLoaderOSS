@@ -32,12 +32,13 @@ class custom_level_formatter : public spdlog::custom_flag_formatter {
 
 void logger::init()
 {
-  if (!std::filesystem::exists(file_manager::public_external_storage)) {
+  if (!std::filesystem::exists(file_manager::external_storage)) {
     return;
   }
 
-  auto rel_file_path = std::filesystem::path{ "monetloader" } / "logs" / "monetloader.log";
-  auto file_path = file_manager::public_external_storage / rel_file_path;
+  // MP Multiplayer: files/TYFMC/MP/moonloader/moonloader.log (next to the scripts, like PC MoonLoader)
+  auto rel_file_path = std::filesystem::path{ "files" } / "TYFMC" / "MP" / "moonloader" / "moonloader.log";
+  auto file_path = file_manager::external_storage / rel_file_path;
   relative_path = rel_file_path.parent_path();
   absolute_path = file_path.parent_path();
   std::filesystem::create_directories(absolute_path);

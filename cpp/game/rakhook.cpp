@@ -28,6 +28,10 @@ bool processing_other_thread;
 std::mutex main_thread_mutex;
 std::deque<queued_send> main_thread_queue;
 
+rakhook::mp::out_rpc_fn g_mp_out_rpc;
+rakhook::mp::out_packet_fn g_mp_out_packet;
+rakhook::mp::apply_rpc_fn g_mp_apply_rpc;
+
 void free_packet(RakNet::Packet* pkt)
 {
   if (pkt->deleteData) {
@@ -195,6 +199,9 @@ bool h_rci_send(RakClientInterface* self, RakNet::BitStream* bitStream, RakNet::
 {
   static const thread_local pid_t THREAD_ID = gettid();
   if (!bitStream->GetNumberOfBitsUsed()) {
+    if (g_mp_out_packet) {
+      return true;
+    }
     return o_rci_send(self, bitStream, priority, reliability, orderingChannel);
   }
   if (lua::script_manager::get_main_thread_id() != THREAD_ID) {
@@ -237,6 +244,10 @@ bool h_rci_send(RakClientInterface* self, RakNet::BitStream* bitStream, RakNet::
     bitStream->SetWriteOffset(old_offset);
   }
 
+  if (g_mp_out_packet) {
+    g_mp_out_packet(new_bs ? new_bs : bitStream);
+    return true;
+  }
   bool result = o_rci_send(self, new_bs ? new_bs : bitStream,
       static_cast<RakNet::PacketPriority>(new_priority),
       static_cast<RakNet::PacketReliability>(new_reliability),
@@ -278,6 +289,10 @@ bool h_rci_rpc(RakClientInterface* self, int* uniqueID, RakNet::BitStream* bitSt
     return true;
   }
 
+  if (g_mp_out_rpc) {
+    g_mp_out_rpc(new_packet_id, new_bs ? new_bs : bitStream);
+    return true;
+  }
   bool result = o_rci_rpc(self, &new_packet_id, new_bs ? new_bs : bitStream,
       static_cast<RakNet::PacketPriority>(new_priority),
       static_cast<RakNet::PacketReliability>(new_reliability),
@@ -561,6 +576,10 @@ void rakhook::emu::rpc(uint8_t id, RakNet::BitStream* bs)
 void rakhook::send::packet(RakNet::BitStream* bs, RakNet::PacketPriority priority, RakNet::PacketReliability reliability, char ordering_channel)
 {
   rakhook::process(); // Ensure relative order
+  if (g_mp_out_packet) {
+    g_mp_out_packet(bs);
+    return;
+  }
   o_rci_send(rci, bs, priority, reliability, ordering_channel);
 }
 
@@ -572,10 +591,93 @@ void rakhook::send::packet_invoke_handlers(RakNet::BitStream* bs, RakNet::Packet
 void rakhook::send::rpc(int id, RakNet::BitStream* bs, RakNet::PacketPriority priority, RakNet::PacketReliability reliability, char ordering_channel)
 {
   rakhook::process(); // Ensure relative order
+  if (g_mp_out_rpc) {
+    if (bs) {
+      bs->ResetReadPointer();
+    }
+    RakNet::BitStream empty;
+    g_mp_out_rpc(id, bs ? bs : &empty);
+    return;
+  }
   o_rci_rpc(rci, &id, bs, priority, reliability, ordering_channel, false, RakNet::UNASSIGNED_NETWORK_ID, nullptr);
 }
 
 void rakhook::send::rpc_invoke_handlers(int id, RakNet::BitStream* bs, RakNet::PacketPriority priority, RakNet::PacketReliability reliability, char ordering_channel)
 {
   h_rci_rpc(rci, &id, bs, priority, reliability, ordering_channel, false, RakNet::UNASSIGNED_NETWORK_ID, nullptr);
+}
+
+// ------ MP Multiplayer mode ------
+void rakhook::mp::init(out_rpc_fn out_rpc, out_packet_fn out_packet, apply_rpc_fn apply_rpc)
+{
+  g_mp_out_rpc = out_rpc;
+  g_mp_out_packet = out_packet;
+  g_mp_apply_rpc = apply_rpc;
+  if (!inited) {
+    RakNet::StringCompressor::AddReference();
+  }
+  inited = true;
+}
+
+bool rakhook::mp::active()
+{
+  return g_mp_out_rpc != nullptr;
+}
+
+bool rakhook::mp::incoming_rpc(std::uint8_t id, RakNet::BitStream* bs, RakNet::BitStream* out)
+{
+  game::netinfo::reset_add_remove();
+  auto [send, new_id, new_bs] = in_rpc(id, bs);
+  if (!send) {
+    return false;
+  }
+  RakNet::BitStream* res = new_bs ? new_bs : bs;
+  if (out) {
+    res->ResetReadPointer();
+    out->Reset();
+    out->Write(res, res->GetNumberOfBitsUsed());
+    out->ResetReadPointer();
+  }
+  return true;
+}
+
+bool rakhook::mp::incoming_packet(RakNet::BitStream* bs)
+{
+  auto [send, new_id, new_bs] = in_packet(bs);
+  return send;
+}
+
+void rakhook::mp::pump()
+{
+  for (int guard = 0; guard < 256 && !emulation_queue.empty(); ++guard) {
+    RakNet::Packet* pkt = emulation_queue.front();
+    emulation_queue.pop_front();
+    if (pkt->length == 0) {
+      free_packet(pkt);
+      continue;
+    }
+    if (pkt->data[0] == RakNet::ID_RPC || (pkt->data[0] == RakNet::ID_TIMESTAMP && pkt->length >= 6 && pkt->data[5] == RakNet::ID_RPC)) {
+      const std::uint32_t skip = pkt->data[0] == RakNet::ID_TIMESTAMP ? 6 : 1;
+      std::int32_t number_of_bits;
+      RakNet::BitStream temp { pkt->data + skip, pkt->length - skip, false };
+      std::uint8_t id;
+      if (temp.Read(id) && temp.ReadCompressed(number_of_bits) && number_of_bits >= 0) {
+        RakNet::BitStream bs {};
+        bs.Write(&temp, number_of_bits);
+        game::netinfo::reset_add_remove();
+        if (game::netinfo::handle_incoming_rpc(id, &bs) && g_mp_apply_rpc) {
+          bs.ResetReadPointer();
+          g_mp_apply_rpc(id, &bs);
+        }
+      }
+    } else {
+      RakNet::BitStream bs { pkt->data, pkt->length, false };
+      std::uint8_t packet_id = bs.GetData()[0];
+      if (packet_id == RakNet::ID_TIMESTAMP && bs.GetNumberOfBytesUsed() >= 6) {
+        packet_id = bs.GetData()[5];
+      }
+      game::netinfo::handle_incoming_packet(packet_id, &bs);
+    }
+    free_packet(pkt);
+  }
 }

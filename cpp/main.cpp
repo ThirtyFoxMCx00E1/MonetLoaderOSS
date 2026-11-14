@@ -10,6 +10,7 @@
 #include "game/customgxt.h"
 #include "game/netinfo.h"
 #include "game/rakhook.h"
+#include "game/mp_bridge.h"
 #include "gui/render.h"
 #include "gui/touch_handler.h"
 #include "hook/monethook.h"
@@ -188,6 +189,7 @@ void h_cgame_process()
   process_touch();
   game::audiostream_sync::process();
   rakhook::process(); // Safe to call even before RakHook is initialized since it only checks queue which is filled after init
+  mp_bridge::process(); // MP Multiplayer: MP's chat / players / dialogs as SA-MP RPCs for the scripts
   game::netinfo::process();
   o_cgame_process();
   if (!g_had_run_lua) { // Scripts are not processed in pause
@@ -515,7 +517,7 @@ extern "C" JNIEXPORT JNICALL jint JNI_OnLoad(JavaVM* vm, void* reserved)
 }
 
 // ------ AML compat ------
-AML_MYMOD(com.monetloader.aml, MonetLoader, PROJECT_VERSION_MAJOR, PROJECT_VERSION_MINOR, PROJECT_VERSION_PATCH, The MonetLoader Team)
+AML_MYMOD(com.monetloader.aml, MonetLoader for MP, PROJECT_VERSION_MAJOR, PROJECT_VERSION_MINOR, PROJECT_VERSION_PATCH, The MonetLoader Team)
 AML_NEEDGAME(com.rockstargames.gtasa)
 
 AML_ENTRYPOINT()

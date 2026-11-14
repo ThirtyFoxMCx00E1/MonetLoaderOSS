@@ -10,6 +10,7 @@ target_sources(${PROJECT_NAME} PRIVATE
 
     cpp/game/customgxt.cpp
     cpp/game/netinfo.cpp
+    cpp/game/mp_bridge.cpp
     cpp/game/rakhook.cpp
     cpp/game/ScriptCommands.cpp
 

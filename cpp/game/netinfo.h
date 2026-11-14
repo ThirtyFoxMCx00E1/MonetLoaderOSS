@@ -219,6 +219,12 @@ class netinfo {
   static inline std::string address {};
   static inline std::uint16_t port {};
 
+  // MP Multiplayer bridge (cpp/game/mp_bridge.cpp)
+  static void mp_stream_in(std::uint16_t id, CPed* ped) { player_stream_in(id, ped); }
+  static void mp_stream_out(std::uint16_t id) { player_stream_out(id); }
+  static bool mp_is_streamed(std::uint16_t id) { return _id_to_ped.find(id) != _id_to_ped.end(); }
+  static void mp_reset() { reset(); }
+
   private:
   static void reset()
   {
