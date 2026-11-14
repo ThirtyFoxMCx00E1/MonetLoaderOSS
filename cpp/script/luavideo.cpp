@@ -661,6 +661,8 @@ bool g_hooked3d = false;
 int g_lastRender = -1000; // g_frame of the last RenderEffects call
 rw::RwTexture* (*g_texCreate)(rw::RwRaster*) = nullptr;
 void* (*g_clumpForAll)(void*, void* (*)(void*, void*), void*) = nullptr;
+void* (*g_geoLock)(void*, int) = nullptr;   // 3.8.8-mp: RpGeometryLock / Unlock make the game build the TV mesh again
+void* (*g_geoUnlock)(void*) = nullptr;
 } // namespace
 
 void luavideo::init3d(void* gtasa)
@@ -678,6 +680,8 @@ void luavideo::init3d(void* gtasa)
   *(void**)&g_rasFromImage = dlsym(gtasa, "_Z20RwRasterSetFromImageP8RwRasterP7RwImage");
   *(void**)&g_texCreate = dlsym(gtasa, "_Z15RwTextureCreateP8RwRaster");
   *(void**)&g_clumpForAll = dlsym(gtasa, "_Z20RpClumpForAllAtomicsP7RpClumpPFP8RpAtomicS2_PvES3_");
+  *(void**)&g_geoLock = dlsym(gtasa, "_Z14RpGeometryLockP10RpGeometryi");
+  *(void**)&g_geoUnlock = dlsym(gtasa, "_Z16RpGeometryUnlockP10RpGeometry");
   VLOG("Im3D: transform %p, render %p / %p, end %p", (void*)g_im3dTransform, (void*)g_im3dRenderPrim, (void*)g_im3dRenderIdx, (void*)g_im3dEnd);
 }
 
@@ -818,6 +822,11 @@ struct Swap {
   std::uint8_t color[4];
   int lastFrame;
   std::string name;
+  // 3.8.8-mp: the screen's own UVs / vertex colours, put back by Restore
+  XRpGeometry* geo = nullptr;
+  std::vector<int> vidx;
+  std::vector<float> ouv;
+  std::vector<std::uint32_t> ocol;
 };
 std::vector<Swap> g_swaps;
 
@@ -837,7 +846,7 @@ std::vector<XRpAtomic*> Atomics(std::uintptr_t ent)
   return out;
 }
 
-struct Pick { XRpMaterial* mat = nullptr; float score = 0; std::string info; };
+struct Pick { XRpMaterial* mat = nullptr; XRpGeometry* geo = nullptr; int matIdx = -1; float score = 0; std::string info; };
 
 // c = screen centre, n = screen normal, w / h = screen size (model space)
 Pick FindScreen(std::uintptr_t ent, const float c[3], const float n[3], float w, float h)
@@ -900,6 +909,8 @@ Pick FindScreen(std::uintptr_t ent, const float c[3], const float n[3], float w,
       const float cover = w * h > 0 ? area / (w * h) : 0;
       if (inside == tris && cover > 0.35f && cover > best.score) {
         best.mat = mat;
+        best.geo = g;
+        best.matIdx = m;
         best.score = cover;
         best.info = nameBuf;
       }
@@ -924,8 +935,64 @@ Pick FindScreen(std::uintptr_t ent, const float c[3], const float n[3], float w,
   return best;
 }
 
+void Reinstance(XRpGeometry* g)
+{
+  // the phone keeps a ready-made copy of the mesh for the GPU: lock + unlock = build it again from the changed arrays
+  if (g_geoLock && g_geoUnlock && Plausible(g)) { g_geoLock(g, 0x18 /* PRELIGHT | TEXCOORDS */); g_geoUnlock(g); }
+}
+
+// 3.8.8-mp: many TV models map their screen to a few texels of a shared texture (or have black vertex colours
+// on the glass), so a video swapped into the material showed as one dark colour = a black screen.
+// ax = { ox,oy,oz, ux,uy,uz, vx,vy,vz }: model-space point of uv (0,0) and the edges to uv (1,0) / (0,1).
+// Every vertex of the screen material gets the uv of its place on the screen and a white vertex colour.
+std::string Remap(Swap& s, XRpGeometry* g, int m, const float ax[9])
+{
+  if (!Plausible(g) || !Plausible(g->triangles) || g->numMorphTargets < 1 || !Plausible(g->morphTarget) || !Plausible(g->morphTarget[0].verts))
+    return "no mesh data";
+  float* uv = (g->numTexCoordSets > 0 && Plausible(g->texCoords[0])) ? g->texCoords[0] : nullptr;
+  if (!uv) return "no uv";
+  std::uint32_t* col = ((g->flags & 0x8) && Plausible(g->preLit)) ? static_cast<std::uint32_t*>(g->preLit) : nullptr;
+  const float uu = ax[3] * ax[3] + ax[4] * ax[4] + ax[5] * ax[5], vv = ax[6] * ax[6] + ax[7] * ax[7] + ax[8] * ax[8];
+  const float uv_ = ax[3] * ax[6] + ax[4] * ax[7] + ax[5] * ax[8], det = uu * vv - uv_ * uv_;
+  if (uu < 1e-6f || vv < 1e-6f || std::fabs(det) < 1e-10f) return "bad axes";
+  std::vector<char> seen(g->numVertices, 0);
+  for (int t = 0; t < g->numTriangles; ++t)
+    if ((int)g->triangles[t].mat == m)
+      for (int k = 0; k < 3; ++k) if (g->triangles[t].v[k] < g->numVertices) seen[g->triangles[t].v[k]] = 1;
+  const float* V = g->morphTarget[0].verts;
+  for (int i = 0; i < g->numVertices; ++i) {
+    if (!seen[i]) continue;
+    s.vidx.push_back(i);
+    s.ouv.push_back(uv[i * 2]); s.ouv.push_back(uv[i * 2 + 1]);
+    s.ocol.push_back(col ? col[i] : 0);
+    const float dx = V[i * 3] - ax[0], dy = V[i * 3 + 1] - ax[1], dz = V[i * 3 + 2] - ax[2];
+    const float du = dx * ax[3] + dy * ax[4] + dz * ax[5], dv = dx * ax[6] + dy * ax[7] + dz * ax[8];
+    const float u = (du * vv - dv * uv_) / det, v = (dv * uu - du * uv_) / det;
+    uv[i * 2] = std::min(1.f, std::max(0.f, u));
+    uv[i * 2 + 1] = std::min(1.f, std::max(0.f, v));
+    if (col) col[i] = 0xFFFFFFFFu;
+  }
+  s.geo = g;
+  Reinstance(g);
+  char buf[96];
+  std::snprintf(buf, sizeof buf, "%d vertices remapped%s%s", (int)s.vidx.size(), col ? ", white" : "", g_geoLock ? "" : ", no RpGeometryLock");
+  return buf;
+}
+
 void Restore(Swap& s)
 {
+  if (Plausible(s.geo) && !s.vidx.empty() && Plausible(s.geo->texCoords[0])) {
+    float* uv = s.geo->texCoords[0];
+    std::uint32_t* col = ((s.geo->flags & 0x8) && Plausible(s.geo->preLit)) ? static_cast<std::uint32_t*>(s.geo->preLit) : nullptr;
+    for (size_t k = 0; k < s.vidx.size(); ++k) {
+      const int i = s.vidx[k];
+      if (i >= s.geo->numVertices) continue;
+      uv[i * 2] = s.ouv[k * 2]; uv[i * 2 + 1] = s.ouv[k * 2 + 1];
+      if (col) col[i] = s.ocol[k];
+    }
+    Reinstance(s.geo);
+  }
+  s.vidx.clear(); s.ouv.clear(); s.ocol.clear(); s.geo = nullptr;
   if (Plausible(s.mat) && s.mat->texture == s.ours) {
     s.mat->texture = s.orig;
     std::memcpy(s.mat->color, s.color, 4);
@@ -1007,7 +1074,9 @@ void luavideo::reg(sol::state& state)
   //   setEntityScreenTexture(entityPtr, raster, {cx,cy,cz}, {nx,ny,nz}, width, height) -> ok, info
   //   call it every frame with the newest frame; restoreEntityScreenTexture([entityPtr]) puts the TV's texture back
   //   (also done by itself 90 frames after the last call)
-  state["setEntityScreenTexture"] = [](double entD, void* raster, sol::table c, sol::table nrm, float w, float h) {
+  //   3.8.8-mp: optional 7th argument axes = { ox,oy,oz, ux,uy,uz, vx,vy,vz } (uv (0,0) and the edges to (1,0) / (0,1)):
+  //   the screen's own uv / vertex colours are replaced so the whole picture shows (put back on restore)
+  state["setEntityScreenTexture"] = [](double entD, void* raster, sol::table c, sol::table nrm, float w, float h, sol::optional<sol::table> axes) {
     const std::uintptr_t ent = (std::uintptr_t)entD;
     if (!Plausible((void*)ent) || !raster || !g_texCreate) return std::make_tuple(false, std::string(g_texCreate ? "bad entity / texture" : "RwTextureCreate not found"));
     for (auto& s : g_swaps) {
@@ -1036,12 +1105,18 @@ void luavideo::reg(sol::state& state)
     ours->refCount += 100000;               // nothing may destroy it (it would destroy the video raster with it)
     ours->filterAddressing = 0x3302;        // linear, clamp U / V
     std::strncpy(ours->name, "mp_tvplayer", 31);
-    Swap s { ent, p.mat, p.mat->texture, ours, {}, g_frame, p.info };
+    Swap s { ent, p.mat, p.mat->texture, ours, {}, g_frame, p.info, nullptr, {}, {}, {} };
     std::memcpy(s.color, p.mat->color, 4);
+    if (axes && p.geo && p.matIdx >= 0) {
+      float ax[9];
+      for (int i = 0; i < 9; ++i) ax[i] = axes->get_or(i + 1, 0.f);
+      s.name += " (" + Remap(s, p.geo, p.matIdx, ax) + ")";
+    }
+    VLOG("screen texture: %s", s.name.c_str());
     p.mat->color[0] = p.mat->color[1] = p.mat->color[2] = p.mat->color[3] = 255; // a dark screen colour would darken the video
     p.mat->texture = ours;
     g_swaps.push_back(s);
-    return std::make_tuple(true, p.info);
+    return std::make_tuple(true, s.name);
   };
   state["restoreEntityScreenTexture"] = [](sol::optional<double> entD) {
     for (size_t i = 0; i < g_swaps.size();) {
