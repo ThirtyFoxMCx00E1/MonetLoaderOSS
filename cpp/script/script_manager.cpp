@@ -38,6 +38,7 @@
 #include "modules/luasocket/unix.h"
 #include "modules/memory.h"
 #include "modules/mimgui/renderer.h"
+#include "modules/mimgui/embedded_lua.h"
 #include "opcodes.h"
 #include "sol/sol.hpp"
 #include "thread.h"
@@ -562,6 +563,69 @@ void lua::script_manager::register_packages(sol::state_view state)
   sol::table package = state["package"];
   package["path"] = path;
   package["cpath"] = cpath;
+
+  // 3.9.1-mp: ffi.load("monetloader") (mimgui/imgui.lua, lib/imgui.lua, monethook.lua and many mods) is a bare
+  // dlopen("libmonetloader.so"). MonetLoader for MP runs from MP's private folder (libMP_monetloader.so) or from
+  // AML's mods folder, which the Android linker never searches by name, so the dlopen failed and LuaJIT printed
+  // the last dlerror() - "undefined symbol: luaJIT_BC_mimgui_cdefs" from the preload probe of require. Every
+  // script now gets MONET_LIB_PATH (the real path of this library) and an ffi.load that maps every MonetLoader
+  // name to it. dlopen() of a library that is already loaded by its full path returns the same handle.
+  static std::string self_path = []() {
+    Dl_info info {};
+    if (dladdr(reinterpret_cast<void*>(&lua::script_manager::register_packages), &info) && info.dli_fname) {
+      return std::string(info.dli_fname);
+    }
+    return std::string("libmonetloader.so");
+  }();
+  state["MONET_LIB_PATH"] = self_path;
+  state.safe_script(R"lua(
+local ok, ffi = pcall(require, 'ffi')
+if ok and ffi and not ffi.__monet_load then
+  local real_load = ffi.load
+  local self_path = MONET_LIB_PATH
+  local names = { monetloader = true, libmonetloader = true, ['libmonetloader.so'] = true,
+                  ['monetloader.so'] = true, ['libMP_monetloader.so'] = true }
+  local cache = {}
+  ffi.load = function(name, global)
+    if type(name) == 'string' then
+      local base = name:match('[^/\\]+$') or name
+      if names[base] then
+        local key = global and 'g' or 'l'
+        if not cache[key] then
+          local okl, lib = pcall(real_load, self_path, global)
+          if not okl then
+            for line in io.lines('/proc/self/maps') do
+              local p = line:match('(/%S*monetloader%S*%.so)$')
+              if p then okl, lib = pcall(real_load, p, global) if okl then break end end
+            end
+          end
+          if not okl then error('MonetLoader: cannot load itself through ffi (' .. tostring(lib) .. ')', 2) end
+          cache[key] = lib
+        end
+        return cache[key]
+      end
+    end
+    return real_load(name, global)
+  end
+  ffi.__monet_load = real_load
+end
+)lua", sol::script_pass_on_error);
+
+  // 3.9.1-mp: mimgui is built into MonetLoader for MP (cpp/script/modules/mimgui/embedded_lua.h, made from
+  // dist/lib/mimgui by tools/embed_lua.py). The files in moonloader/lib/mimgui still win when they are there; a
+  // phone without them (or with a broken copy shipped by a mod) gets the built-in one instead of a dead script.
+  state.add_package_loader(+[](lua_State* L) -> int {
+    const char* module_name = luaL_checkstring(L, 1);
+    const embedded_lua::module* m = embedded_lua::find(module_name);
+    if (!m) {
+      lua_pushfstring(L, "\n\tno built-in module '%s'", module_name);
+      return 1;
+    }
+    if (luaL_loadbuffer(L, m->source, m->size, m->chunk_name) != 0) {
+      return lua_error(L);
+    }
+    return 1;
+  });
   state.add_package_loader(+[](lua_State* L) -> int {
     const char* module_name = luaL_checkstring(L, 1);
 

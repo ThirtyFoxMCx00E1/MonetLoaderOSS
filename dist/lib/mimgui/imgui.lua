@@ -4,7 +4,32 @@ local cdecl = assert(require "mimgui.cdefs", "imgui.lua not properly build")
 ffi.cdef(cdecl)
 
 --load dll
-local lib = ffi.load("monetloader")
+-- 3.9.1-mp: find MonetLoader's own library. A bare ffi.load("monetloader") never finds MonetLoader for MP on
+-- Android (it runs from MP's private folder or AML's mods folder), and the failed dlopen showed the stale
+-- "undefined symbol: luaJIT_BC_mimgui_cdefs" error. MonetLoader for MP 3.9.1+ maps the name itself; older builds:
+-- MONET_LIB_PATH, then the real path from /proc/self/maps.
+local function __monet_lib()
+    local ok, l = pcall(ffi.load, "monetloader")
+    if ok and l then return l end
+    local err = l
+    if MONET_LIB_PATH then
+        local ok2, l2 = pcall(ffi.load, MONET_LIB_PATH)
+        if ok2 and l2 then return l2 end
+    end
+    local f = io.open("/proc/self/maps", "r")
+    if f then
+        for line in f:lines() do
+            local p = line:match("(/%S*monetloader%S*%.so)$")
+            if p then
+                local ok3, l3 = pcall(ffi.load, p)
+                if ok3 and l3 then f:close() return l3 end
+            end
+        end
+        f:close()
+    end
+    error("can't load MonetLoader's library through ffi: " .. tostring(err), 2)
+end
+local lib = __monet_lib()
 
 -----------ImVec2 definition
 local ImVec2 
