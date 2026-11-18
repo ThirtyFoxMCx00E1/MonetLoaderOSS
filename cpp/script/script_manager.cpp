@@ -751,10 +751,10 @@ void lua::script_manager::register_script_info_functions(script& s)
       sol::no_constructor,
       sol::meta_function::equal_to, sol::object(state, sol::in_place, &script::lua_info::operator==),
       "this", sol::readonly_property([&s = s]() { return s.info; }),
-      "name", sol::readonly(&script::lua_info::name),
-      "description", sol::readonly(&script::lua_info::description),
-      "version_num", sol::readonly(&script::lua_info::version_number),
-      "version", sol::readonly(&script::lua_info::version),
+      "name", sol::readonly_property([](const script::lua_info& i) { return i.name; }),
+      "description", sol::readonly_property([](const script::lua_info& i) { return i.description; }),
+      "version_num", sol::readonly_property([](const script::lua_info& i) { return i.version_number; }),
+      "version", sol::readonly_property([](const script::lua_info& i) { return i.version; }),
       "authors", sol::readonly_property([](script::lua_info& self, sol::this_state state) {
         sol::table authors { state, sol::new_table { static_cast<int>(self.authors.size()) } };
         int i = 1;
@@ -773,13 +773,13 @@ void lua::script_manager::register_script_info_functions(script& s)
         }
         return dependencies;
       }),
-      "path", sol::readonly(&script::lua_info::path),
-      "filename", sol::readonly(&script::lua_info::filename),
-      "directory", sol::readonly(&script::lua_info::directory),
+      "path", sol::readonly_property([](const script::lua_info& i) { return i.path; }),
+      "filename", sol::readonly_property([](const script::lua_info& i) { return i.filename; }),
+      "directory", sol::readonly_property([](const script::lua_info& i) { return i.directory; }),
       "frozen", sol::var(false),
       "dead", sol::readonly_property(&script::lua_info::get_dead),
-      "id", sol::readonly(&script::lua_info::id),
-      "url", sol::readonly(&script::lua_info::url),
+      "id", sol::readonly_property([](const script::lua_info& i) { return i.id; }),
+      "url", sol::readonly_property([](const script::lua_info& i) { return i.url; }),
       "properties", sol::readonly_property([](sol::this_state state, script::lua_info& self) {
         sol::table properties { state, sol::new_table { static_cast<int>(self.properties.size()) } };
         int i = 1;
