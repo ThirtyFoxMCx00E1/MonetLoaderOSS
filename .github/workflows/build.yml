@@ -1,0 +1,51 @@
+name: Build MonetLoader for MP
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'cpp/**'
+      - 'lib/**'
+      - 'dist/**'
+      - 'tools/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host tools
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib ninja-build
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+          add-to-path: true
+      - name: LuaJIT from source (ThirtyFoxMCx00E1/LuaJIT v2.1)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          git clone --depth 1 -b v2.1 https://github.com/ThirtyFoxMCx00E1/LuaJIT /tmp/LuaJIT
+          bash tools/build_luajit.sh /tmp/LuaJIT
+      - name: Build libmonetloader.so (arm64-v8a, armeabi-v7a)
+        env:
+          NDK: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          for ABI in arm64-v8a armeabi-v7a; do
+            cmake -S . -B build-$ABI -G Ninja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+              -DANDROID_ABI=$ABI -DANDROID_PLATFORM=android-24 -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+            cmake --build build-$ABI -j4 --target monetloader
+            mkdir -p out/$ABI && cp build-$ABI/libmonetloader.so out/$ABI/
+          done
+          ls -la out/*
+      - name: Lua libraries (dist)
+        run: |
+          mkdir -p out && cd dist && zip -qr9 ../out/monetloader-dist.zip . && cd .. && ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: monetloader-mp
+          path: out/
+          if-no-files-found: error
