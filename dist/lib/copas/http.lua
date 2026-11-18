@@ -37,7 +37,6 @@ _M.SSLPORT = 443
 _M.SSLPROTOCOL = "tlsv1_2"
 _M.SSLOPTIONS  = "all"
 _M.SSLVERIFY   = "none"
-_M.SSLSNISTRICT = false
 
 
 -----------------------------------------------------------------------------
@@ -205,13 +204,13 @@ end
 -----------------------------------------------------------------------------
 local function adjusturi(reqt)
     local u = reqt
+    reqt.fragment = nil -- fragments are client-side only and must never be sent on the wire
     -- if there is a proxy, we need the full url. otherwise, just a part.
     if not reqt.proxy and not _M.PROXY then
         u = {
            path = socket.try(reqt.path, "invalid path 'nil'"),
            params = reqt.params,
            query = reqt.query,
-           fragment = reqt.fragment
         }
     end
     return url.build(u)
@@ -261,6 +260,11 @@ local function adjustrequest(reqt)
     local nreqt = reqt.url and url.parse(reqt.url, default) or {}
     -- explicit components override url
     for i,v in base.pairs(reqt) do nreqt[i] = v end
+    socket.try(base.type(nreqt.scheme) == "string",
+        "invalid scheme '" .. base.tostring(nreqt.scheme) .. "'")
+    nreqt.scheme = string.lower(nreqt.scheme)
+    socket.try(nreqt.scheme == "http" or nreqt.scheme == "https",
+        "unsupported scheme '" .. nreqt.scheme .. "'")
     if nreqt.port == "" then nreqt.port = 80 end
     socket.try(nreqt.host and nreqt.host ~= "",
         "invalid host '" .. base.tostring(nreqt.host) .. "'")
@@ -350,6 +354,16 @@ end
     return 1, code, headers, status
 end
 
+-- Returns true if `host` is a literal IPv4 or IPv6 address rather than a DNS
+-- hostname. RFC 6066 disallows IP literals in the TLS SNI extension, so these
+-- must not be sent as an SNI name.
+local function ishostliteral(host)
+  if string.find(host, ":", 1, true) then
+    return true -- IPv6 addresses always contain a colon (socket.url strips the brackets)
+  end
+  return string.match(host, "^%d+%.%d+%.%d+%.%d+$") ~= nil
+end
+
 -- Return a function which creates a tcp socket that will
 -- include the optional SSL/TLS connection, and unsafe redirect checks
 function _M.getcreatefunc(params)
@@ -361,9 +375,7 @@ function _M.getcreatefunc(params)
       options = params.options,
       verify = params.verify,
    }
-   ssl_params.sni = ssl_params.sni or {
-      strict = _M.SSLSNISTRICT
-   }
+   ssl_params.sni = ssl_params.sni or {}
 
    -- Default settings
    ssl_params.wrap.protocol = ssl_params.wrap.protocol or _M.SSLPROTOCOL
@@ -373,8 +385,9 @@ function _M.getcreatefunc(params)
    end
    ssl_params.wrap.mode = "client"   -- Force client mode
 
-   if not ssl_params.sni.names then
-      -- names haven't been set, and hence will be set below. Since this alters
+   local sni_name = ssl_params.sni.names
+   if not sni_name then
+      -- name hasn't been set, and hence will be set below. Since this alters
       -- the table, we must make a copy. Otherwise the altered table might be
       -- reused if a redirect is encountered.
       local old_params = ssl_params
@@ -382,18 +395,37 @@ function _M.getcreatefunc(params)
       for k,v in pairs(old_params) do
         ssl_params[k] = v
       end
-      ssl_params.sni = { strict = old_params.sni.strict }
+      ssl_params.sni = {}
    end
 
    -- upvalue to track https -> http redirection
    local washttps = false
+   local first_request = true -- on follow up redirects we must clear sni-name
 
    -- 'create' function for LuaSocket
    return function (reqt)
       local u = url.parse(reqt.url)
-      if (reqt.scheme or u.scheme) == "https" then
-        -- set SNI name to host if not given
-        ssl_params.sni.names = ssl_params.sni.names or u.host
+      local scheme = string.lower(reqt.scheme or u.scheme or "")
+      socket.try(scheme == "http" or scheme == "https",
+          "unsupported scheme '" .. scheme .. "'")
+      if scheme == "https" then
+        if type(ssl_params.sni) ~= "table" then
+          ssl_params.sni = {}  -- was collapsed to `false` below on a prior IP-literal hop
+        end
+        if first_request then
+          ssl_params.sni.names = sni_name    -- set SNI name to the given name
+          first_request = false
+        else
+          ssl_params.sni.names = nil         -- clear SNI name for follow up redirects
+        end
+        if not ssl_params.sni.names and not ishostliteral(u.host) then
+          ssl_params.sni.names = u.host
+        end
+        if not ssl_params.sni.names then
+          -- no hostname to send: u.host is an IP literal, which RFC 6066 forbids
+          -- in the SNI extension, so omit it entirely rather than send a bogus name
+          ssl_params.sni = false
+        end
         -- https, provide an ssl wrapped socket
         local conn = copas.wrap(socket.tcp(), ssl_params)
         -- insert https default port, overriding http port inserted by LuaSocket

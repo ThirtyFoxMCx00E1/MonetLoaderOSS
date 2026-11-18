@@ -1,19 +1,11 @@
 -- Lua Requests library for http ease
 
-local http_socket = require('socket.http')
-local has_https, https_socket = pcall(require, 'ssl.https')
-if not has_https then
-  https_socket = nil
-end
 local url_parser = require('socket.url')
 local ltn12 = require('ltn12')
 local json = require('cjson.safe')
-local has_xml, xml = pcall(require, 'xml')
-if not has_xml then
-  xml = nil
-end
+local xml = require('xml')
 local md5sum = require('md5') -- TODO: Make modular?
-local base64 = require('base64')
+local mime = require('mime')
 
 local requests = {
   _DESCRIPTION = 'Http requests made simpler',
@@ -73,11 +65,17 @@ function requests.request(method, url, args)
 
   if type(url) == "table" then
     request = url
+    if not request.url and request[1] then
+      request.url = table.remove(request, 1)
+    end
   else
     request = args or {}
     request.url = url
   end
 
+  requests.http_socket = requests.http_socket or require('socket.http')
+  requests.https_socket = requests.https_socket or require('ssl.https')
+  
   request.method = method
   _requests.parse_args(request)
 
@@ -97,37 +95,24 @@ function _requests.make_request(request)
     method = request.method,
     url = request.url,
     headers = request.headers,
-    source = ltn12.source.string(request.data),
     sink = ltn12.sink.table(response_body),
     redirect = request.allow_redirects,
     proxy = request.proxy
   }
+  if request.data then
+    full_request.source = ltn12.source.string(request.data)
+  end
 
   local response = {}
   local ok
-  local want_https = string.find(full_request.url, '^https:') ~= nil
-  local socket
-
-  if not want_https or request.proxy then
-    --Use HTTP
-    socket = requests.http_socket
-  elseif want_https and not https_socket then
-    --Try to fallback to HTTP
-    full_request.url = string.gsub(full_request.url, '^https:', 'http:', 1)
-    socket = requests.http_socket
-  else
-    --Use HTTPS
-    socket = requests.https_socket
-  end
+  local socket = string.find(full_request.url, '^https:') and not request.proxy and requests.http_socket or requests.https_socket
 
   ok, response.status_code, response.headers, response.status = socket.request(full_request)
 
   assert(ok, 'error in '..request.method..' request: '..response.status_code)
   response.text = table.concat(response_body)
   response.json = function () return json.decode(response.text) end
-  if xml ~= nil then
-    response.xml = function () return xml.load(response.text) end
-  end
+  response.xml = function () return xml.load(response.text) end
 
   return response
 end
@@ -178,7 +163,9 @@ end
 -- Add to the HTTP header
 function _requests.create_header(request)
   request.headers = request.headers or {}
-  request.headers['Content-Length'] = request.data:len()
+  if request.data then
+    request.headers['Content-Length'] = request.data:len()
+  end
 
   if request.cookies then
     if request.headers.cookie then
@@ -195,19 +182,17 @@ end
 
 --Makes sure that the data is in a format that can be sent
 function _requests.check_data(request)
-  request.data = request.data or ''
-
   if type(request.data) == "table" then
     request.data = json.encode(request.data)
+  elseif request.data then
+    request.data = tostring(request.data)
   end
 end
 
 --Set the timeout
 function _requests.check_timeout(timeout)
   requests.http_socket.TIMEOUT = timeout or 5
-  if requests.https_socket ~= nil then
-    requests.https_socket.TIMEOUT = timeout or 5
-  end
+  requests.https_socket.TIMEOUT = timeout or 5
 end
 
 --Checks is allow_redirects parameter is set correctly
@@ -219,14 +204,13 @@ end
 
 --Create the Authorization header for Basic Auth
 function _requests.basic_auth_header(request)
-  local encoded = base64.encode(request.auth.user..':'..request.auth.password)
+  local encoded = mime.b64(request.auth.user..':'..request.auth.password)
   request.headers.Authorization = 'Basic '..encoded
 end
 
 -- Create digest authorization string for request header TODO: Could be better, but it should work
 function _requests.digest_create_header_string(auth)
-  local authorization = ''
-  authorization = 'Digest username="'..auth.user..'", realm="'..auth.realm..'", nonce="'..auth.nonce
+  local authorization = 'Digest username="'..auth.user..'", realm="'..auth.realm..'", nonce="'..auth.nonce
   authorization = authorization..'", uri="'..auth.uri..'", qop='..auth.qop..', nc='..auth.nc
   authorization = authorization..', cnonce="'..auth.cnonce..'", response="'..auth.response..'"'
 

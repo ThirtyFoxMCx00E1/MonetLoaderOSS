@@ -1,5 +1,10 @@
 local copas = require("copas")
-local gettime = require("socket").gettime
+local gettime = copas.gettime
+
+local coroutine_running = coroutine.running
+if _VERSION=="Lua 5.1" and not jit then     -- obsolete: only for Lua 5.1 compatibility
+  coroutine_running = require("coxpcall").running
+end
 
 local DEFAULT_TIMEOUT = 10
 
@@ -104,7 +109,7 @@ end
 -- @param timeout (optional) timeout in seconds, defaults to the timeout passed to `new` (use `math.huge` to have no timeout).
 -- @return wait-time on success, or nil+error+wait_time on failure. Errors can be "timeout", "destroyed", or "lock is not re-entrant"
 function lock:get(timeout)
-  local co = coroutine.running()
+  local co = coroutine_running()
   local start_time
 
   -- is the lock already taken?
@@ -115,12 +120,13 @@ function lock:get(timeout)
       return 0
     end
 
-    self.queue[self.q_tail] = co
-    self.q_tail = self.q_tail + 1
     timeout = timeout or self.timeout
     if timeout == 0 then
       return nil, "timeout", 0
     end
+
+    self.queue[self.q_tail] = co
+    self.q_tail = self.q_tail + 1
 
     -- set up timeout
     registry[co] = self
@@ -154,7 +160,7 @@ end
 -- an error.
 -- returns true, or nil+err on an error
 function lock:release()
-  local co = coroutine.running()
+  local co = coroutine_running()
 
   if co ~= self.owner then
     return nil, "cannot release a lock not owned"
@@ -167,17 +173,18 @@ function lock:release()
   end
 
   -- need a loop, since individual coroutines might have been removed
-  -- so there might be holes
+  -- (or canceled externally, eg. via `copas.removethread`/`future:cancel`)
+  -- so there might be holes, or stale entries whose wakeup will fail
   while self.q_tip < self.q_tail do
     local next_up = self.queue[self.q_tip]
-    if next_up then
+    self.queue[self.q_tip] = nil
+    self.q_tip = self.q_tip + 1
+    if next_up and copas.wakeup(next_up) then
       self.owner = next_up
-      self.queue[self.q_tip] = nil
-      self.q_tip = self.q_tip + 1
-      copas.wakeup(next_up)
       return true
     end
-    self.q_tip = self.q_tip + 1
+    -- either an empty hole, or 'next_up' was canceled and will never resume
+    -- to release the lock itself, so move on to the next waiter in line
   end
   -- queue is empty, reset pointers
   self.owner = nil

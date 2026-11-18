@@ -25,11 +25,20 @@ end
 
 do
   local function expire_func(self, initial_delay)
+    local my_co = coroutine_running()
     if self.errorhandler then
       copas.seterrorhandler(self.errorhandler)
     end
     copas.pause(initial_delay)
     while true do
+      if self.co ~= my_co then
+        -- This generation was replaced (eg. the callback cancelled and
+        -- rearmed the timer, synchronously, before returning). `self.co`
+        -- and `self.cancelled` now belong to the new generation, so this
+        -- coroutine must exit without touching them.
+        return
+      end
+
       if not self.cancelled then
         if not self.recurring then
           -- non-recurring timer
@@ -43,6 +52,11 @@ do
           -- recurring timer
           self:callback(self.params)
         end
+      end
+
+      if self.co ~= my_co then
+        -- replaced while the callback was running, see above
+        return
       end
 
       if self.cancelled then
@@ -75,6 +89,10 @@ end
 
 
 --- Cancels a running timer.
+-- If the timer callback is currently in progress (eg. yielded on socket I/O),
+-- it is allowed to run to completion, it just won't be rescheduled. Only a
+-- timer that is idle, waiting for its next recurrence, is woken up and
+-- stopped immediately.
 -- @return timer object, or nil+error
 function timer:cancel()
   if not self.co then
@@ -86,8 +104,7 @@ function timer:cancel()
   end
 
   self.cancelled = true
-  copas.wakeup(self.co)       -- resume asap
-  copas.removethread(self.co) -- will immediately drop the thread upon resuming
+  copas.wakeup(self.co) -- in case it's idle between recurrences, exit immediately
   self.co = nil
   return self
 end
@@ -106,7 +123,7 @@ do
   -- `opts.params` (optional) this value will be passed to the timer callback, `opts.initial_delay` (optional) the first delay to use, defaults to `delay`.
   -- @return timer object, or throws an error on bad input
   function timer.new(opts)
-    assert(opts.delay or -1 >= 0, "delay must be greater than or equal to 0")
+    assert((opts.delay or -1) >= 0, "delay must be greater than or equal to 0")
     assert(type(opts.callback) == "function", "expected callback to be a function")
 
     local callback = function(timer_obj, params)

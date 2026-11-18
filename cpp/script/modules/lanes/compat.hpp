@@ -165,13 +165,13 @@ template <typename... EXTRA>
 inline std::string_view luaW_pushstring(lua_State* const L_, std::string_view const& str_, EXTRA&&... extra_)
 {
     if constexpr (sizeof...(EXTRA) == 0) {
-        if constexpr (LUA_VERSION_NUM == 501) {
-            // lua_pushlstring doesn't return a value in Lua 5.1
-            lua_pushlstring(L_, str_.data(), str_.size());
-            return luaW_tostring(L_, kIdxTop);
-        } else {
-            return std::string_view{ lua_pushlstring(L_, str_.data(), str_.size()), str_.size() };
-        }
+#if LUA_VERSION_NUM == 501
+        // lua_pushlstring doesn't return a value in Lua 5.1 / LuaJIT
+        lua_pushlstring(L_, str_.data(), str_.size());
+        return luaW_tostring(L_, kIdxTop);
+#else
+        return std::string_view{ lua_pushlstring(L_, str_.data(), str_.size()), str_.size() };
+#endif
     } else {
         static_assert((... && std::is_trivial_v<std::decay_t<EXTRA>>));
         return std::string_view{ lua_pushfstring(L_, str_.data(), std::forward<EXTRA>(extra_)...) };
