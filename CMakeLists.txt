@@ -23,7 +23,7 @@ else()
 endif()
 
 # ------ Project ------
-project(monetloader VERSION 3.9.1)
+project(monetloader VERSION 4.0.0)
 add_library(${PROJECT_NAME} SHARED)
 include_directories(${PROJECT_SOURCE_DIR}/cpp)
 include_directories(${PROJECT_SOURCE_DIR}/lib)
@@ -63,6 +63,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE crypto ssl tls)
 # ------ Project sources ------
 include(lib/CMakeLists.txt)
 include(cpp/CMakeLists.txt)
+include(cpp/script/modules/natives.cmake)
 
 
 # ------ Definitions ------

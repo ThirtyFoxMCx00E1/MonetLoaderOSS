@@ -16,6 +16,7 @@
 #include "gui/render.h"
 #include "gui/touch_handler.h"
 #include "hook/monethook.h"
+#include "script/modules/pccompat.h"
 #include "lib_manager.h"
 #include "logger.h"
 #include "offsets.h"
@@ -210,6 +211,7 @@ monethook::plt_hook<void()> o_cgame_process;
 void h_cgame_process()
 {
   g_had_run_lua = false;
+  lua::pccompat::frame_tick(); // 4.0.0-mp: wasKeyPressed / wasKeyReleased edges
   luavideo::frame_tick(); // 3.8.5-mp: last frame's 3D draws are gone, old video rasters are freed
   process_touch();
   game::audiostream_sync::process();

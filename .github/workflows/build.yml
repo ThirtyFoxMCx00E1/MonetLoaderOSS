@@ -29,6 +29,14 @@ jobs:
         run: |
           git clone --depth 1 -b v2.1 https://github.com/ThirtyFoxMCx00E1/LuaJIT /tmp/LuaJIT
           bash tools/build_luajit.sh /tmp/LuaJIT
+      - name: Lua syntax check (host LuaJIT)
+        run: |
+          make -C /tmp/LuaJIT/src -j4 >/dev/null
+          bad=0
+          while IFS= read -r -d '' f; do
+            if ! /tmp/LuaJIT/src/luajit -b "$f" /dev/null 2>/tmp/err; then echo "::warning file=$f::$(cat /tmp/err)"; bad=$((bad+1)); fi
+          done < <(find dist -name '*.lua' -print0)
+          echo "$bad file(s) not LuaJIT-parsable"
       - name: Build libmonetloader.so (arm64-v8a, armeabi-v7a)
         env:
           NDK: ${{ steps.ndk.outputs.ndk-path }}

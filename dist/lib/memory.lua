@@ -9,6 +9,19 @@
 local ffi = require 'ffi'
 local memory = {} -- all function must accept number-type address
 
+-- 4.0.0-mp: PC GTA:SA addresses (gta_sa.exe 1.0 US, e.g. 0xB7CB84) are translated to the real libGTASA.so objects
+-- by MonetLoader's pccompat layer (plugin-sdk-sa names -> mobile symbols). PC addresses without a mobile
+-- counterpart read as 0 and are not written, instead of crashing the game.
+local pcc_ok, pcc = pcall(require, 'pccompat')
+if not pcc_ok then pcc = nil end
+local function pcaddr(address, size)
+    if pcc and type(address) == 'number' and address < 0x1000000 then
+        return pcc.translate(address, size or 4)
+    end
+    return address, false
+end
+memory.pcaddr = pcaddr
+
 local page_access = {
     NOACCESS          = 0x00, -- ---
     READONLY          = 0x01, -- r-- Default for rodata.
@@ -59,6 +72,10 @@ local function protect_maybe(address, size, prot)
 end
 
 function memory.read(address, size, unprot)
+    local widen
+    address, widen = pcaddr(address, size)
+    if address == nil then return 0 end
+    if widen then size = 8 end
     if size > 0 then
         if size > 8 then
             size = 8
@@ -77,6 +94,10 @@ function memory.read(address, size, unprot)
 end
 
 function memory.write(address, value, size, unprot)
+    local widen
+    address, widen = pcaddr(address, size)
+    if address == nil then return end
+    if widen then size = 8 end
     if size > 0 then
         if size > 8 then
             size = 8
@@ -91,16 +112,23 @@ function memory.write(address, value, size, unprot)
 end
 
 function memory.unprotect(address, size)
+    address = pcaddr(address, size)
+    if address == nil then return end
     address = ffi.cast(pvoid_t, address)
     return unprotect(address, size)
 end
 
 function memory.protect(address, size, prot)
+    address = pcaddr(address, size)
+    if address == nil then return end
     address = ffi.cast(pvoid_t, address)
     return set_protection(address, size, prot, true)
 end
 
 function memory.copy(dst, src, size, unprot)
+    dst = pcaddr(dst, size)
+    if type(src) == 'number' then src = pcaddr(src, size) end
+    if dst == nil or src == nil then return end
     dst = ffi.cast(pvoid_t, dst)
     if type(src) ~= 'string' then
         src = ffi.cast(pvoid_t, src)
@@ -112,6 +140,8 @@ function memory.copy(dst, src, size, unprot)
 end
 
 function memory.fill(address, value, size, unprot)
+    address = pcaddr(address, size)
+    if address == nil then return end
     address = ffi.cast(pvoid_t, address)
     local prot = unprotect_maybe(address, size, unprot)
     if not unprot or prot ~= nil then
@@ -120,6 +150,8 @@ function memory.fill(address, value, size, unprot)
 end
 
 function memory.tostring(address, size, unprot)
+    address = pcaddr(address, size)
+    if address == nil then return end
     address = ffi.cast(pvoid_t, address)
     local prot = unprotect_maybe(address, size, unprot)
     if not unprot or prot ~= nil then
@@ -185,7 +217,19 @@ function memory.hex2bin(hex, dst, size)
     end
 end
 
+local get_value_raw
 local function get_value(ctype, address, unprot)
+    local widen
+    address, widen = pcaddr(address, ffi.sizeof(ctype))
+    if address == nil then return 0 end
+    if widen then
+        local v = get_value_raw('uintptr_t', address, unprot)
+        return v and tonumber(v)
+    end
+    return get_value_raw(ctype, address, unprot)
+end
+
+get_value_raw = function(ctype, address, unprot)
     address = ffi.cast(pvoid_t, address)
     local size = ffi.sizeof(ctype)
     local prot = unprotect_maybe(address, size, unprot)
@@ -196,6 +240,10 @@ local function get_value(ctype, address, unprot)
 end
 
 local function set_value(ctype, address, value, unprot)
+    local widen
+    address, widen = pcaddr(address, ffi.sizeof(ctype))
+    if address == nil then return end
+    if widen then ctype = 'uintptr_t' end
     address = ffi.cast(pvoid_t, address)
     local size = ffi.sizeof(ctype)
     local prot = unprotect_maybe(address, size, unprot)

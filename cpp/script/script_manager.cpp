@@ -37,6 +37,16 @@
 #include "modules/luasocket/serial.h"
 #include "modules/luasocket/unix.h"
 #include "modules/memory.h"
+#include "modules/pccompat.h"
+
+extern "C" { // 4.0.0-mp native modules (cpp/script/modules/natives.cmake)
+int luaopen_lpeg(lua_State* L);
+int luaopen_rex_posix(lua_State* L);
+int luaopen_rex_pcre2(lua_State* L);
+int luaopen_luasql_sqlite3(lua_State* L);
+int luaopen_lanes_core(lua_State* L);
+int luaopen_xml_core(lua_State* L);
+}
 #include "modules/mimgui/renderer.h"
 #include "modules/mimgui/embedded_lua.h"
 #include "opcodes.h"
@@ -152,6 +162,7 @@ void lua::script_manager::init()
   // setup
   _main_thread_id = gettid();
   _root_path = monetloader_path;
+  pccompat::set_root(_root_path.string());
   std::filesystem::current_path(monetloader_path);
   init_modules();
 
@@ -224,6 +235,7 @@ std::optional<std::size_t> lua::script_manager::load(std::filesystem::path path)
   register_script_info_functions(ref);
   register_thread_functions(ref);
   register_memory_functions(ref);
+  pccompat::register_functions(ref.state);
 
   // Opcodes
   opcodes::reg(ref.state);
@@ -529,6 +541,15 @@ void lua::script_manager::init_modules()
   _modules.emplace("ssl.context", luaopen_ssl_context);
   _modules.emplace("ssl.x509", luaopen_ssl_x509);
   _modules.emplace("ssl.config", luaopen_ssl_config);
+
+  _modules.emplace("pccompat", pccompat::luaopen_pccompat); // 4.0.0-mp PC MoonLoader layer
+  _modules.emplace("lpeg", luaopen_lpeg);
+  _modules.emplace("rex_posix", luaopen_rex_posix);
+  _modules.emplace("rex_pcre2", luaopen_rex_pcre2);
+  _modules.emplace("rex_pcre", luaopen_rex_pcre2); // PC scripts written for lrexlib's PCRE1 binding: same API
+  _modules.emplace("luasql.sqlite3", luaopen_luasql_sqlite3);
+  _modules.emplace("lanes.core", luaopen_lanes_core);
+  _modules.emplace("xml.core", luaopen_xml_core);
 }
 
 void lua::script_manager::register_packages(sol::state_view state)
@@ -904,9 +925,28 @@ void lua::script_manager::register_memory_functions(script& s)
     return i;
   };
 
-  state["writeMemory"] = &memory::write;
-  state["readMemory"] = &memory::read;
-
+  // 4.0.0-mp: PC addresses (gta_sa.exe 1.0 US) are translated to libGTASA.so; unknown PC addresses never crash
+  state["writeMemory"] = [](std::uintptr_t address, std::size_t size, double value, std::optional<bool> unprotect) {
+    bool widen = false;
+    if (!pccompat::fix(address, size, &widen)) {
+      return;
+    }
+    if (widen) {
+      memory::write64(address, value, true, unprotect);
+      return;
+    }
+    memory::write(address, size, static_cast<std::int32_t>(static_cast<std::int64_t>(value)), unprotect);
+  };
+  state["readMemory"] = [](std::uintptr_t address, std::size_t size, std::optional<bool> unprotect) -> double {
+    bool widen = false;
+    if (!pccompat::fix(address, size, &widen)) {
+      return 0;
+    }
+    if (widen) {
+      return memory::read64(address, true, unprotect);
+    }
+    return memory::read(address, size, unprotect);
+  };
   state["allocateMemory"] = [&s = s](std::size_t size) {
     void* allocation = std::malloc(size);
     if (allocation != nullptr) {
@@ -919,23 +959,40 @@ void lua::script_manager::register_memory_functions(script& s)
     std::free(reinterpret_cast<void*>(memory));
   };
 
-  state["getStructElement"] = [](std::uintptr_t base, std::uintptr_t offset, std::size_t size, std::optional<bool> unprotect) {
-    return memory::read(base + offset, size, unprotect);
+  state["getStructElement"] = [](std::uintptr_t base, std::uintptr_t offset, std::size_t size, std::optional<bool> unprotect) -> double {
+    std::uintptr_t a = base + offset;
+    bool widen = false;
+    if (!pccompat::fix(a, size, &widen)) {
+      return 0;
+    }
+    return widen ? memory::read64(a, true, unprotect) : memory::read(a, size, unprotect);
   };
   state["getStructFloatElement"] = [](std::uintptr_t base, std::uintptr_t offset, std::optional<bool> unprotect) {
-    std::uint32_t i = memory::read(base + offset, sizeof(i), unprotect);
+    std::uintptr_t a = base + offset;
+    if (!pccompat::fix(a, 4)) {
+      return 0.0f;
+    }
+    std::uint32_t i = memory::read(a, sizeof(i), unprotect);
     float f;
     std::memcpy(&f, &i, sizeof(f));
     return f;
   };
   state["setStructElement"] = [](std::uintptr_t base, std::uintptr_t offset, std::size_t size,
                                              std::int32_t value, std::optional<bool> unprotect) {
-    memory::write(base + offset, size, value, unprotect);
+    std::uintptr_t a = base + offset;
+    if (!pccompat::fix(a, size)) {
+      return;
+    }
+    memory::write(a, size, value, unprotect);
   };
   state["setStructFloatElement"] = [](std::uintptr_t base, std::uintptr_t offset, float value, std::optional<bool> unprotect) {
     std::int32_t i;
     std::memcpy(&i, &value, sizeof(i));
-    memory::write(base + offset, sizeof(i), i, unprotect);
+    std::uintptr_t a = base + offset;
+    if (!pccompat::fix(a, 4)) {
+      return;
+    }
+    memory::write(a, sizeof(i), i, unprotect);
   };
 }
 

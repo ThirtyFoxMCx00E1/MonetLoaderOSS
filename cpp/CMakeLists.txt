@@ -74,6 +74,7 @@ target_sources(${PROJECT_NAME} PRIVATE
     cpp/script/modules/lbase64.c
     cpp/script/modules/monethook.cpp
     cpp/script/modules/memory.cpp
+    cpp/script/modules/pccompat.cpp
 
     cpp/script/luabass.cpp
     cpp/script/luajson.cpp
