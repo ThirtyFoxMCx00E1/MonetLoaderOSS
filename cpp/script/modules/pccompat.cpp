@@ -724,6 +724,35 @@ void register_functions(sol::state& state)
   state["setVirtualKeyDown"] = [](int vk, bool down) { set_virtual_key(vk, down); };
   state["isGameWindowForeground"] = []() { return true; };
   state["getD3DDevicePtr"] = []() { return 0; }; // no Direct3D on Android (OpenGL ES); d3d9 scripts must use mimgui / render*
+
+  // --- ffi.load("foo.dll" / "C:\\...\\foo.dll") -> Android build lib<foo>.so / <foo>.so next to the script or in lib/ ---
+  state["__pccompat_so_candidates"] = [](std::string name, sol::this_state ts) {
+    sol::state_view lua(ts);
+    sol::table t = lua.create_table();
+    int i = 1;
+    for (auto& c : so_candidates(name)) t[i++] = c;
+    return t;
+  };
+  state.safe_script(R"LUA(
+local ok, ffi = pcall(require, 'ffi')
+if ok and ffi and not ffi.__pccompat then
+  local raw_load = ffi.load
+  ffi.__pccompat = true
+  local winsys = { kernel32 = 'c', user32 = 'c', msvcrt = 'c', ucrtbase = 'c', ws2_32 = 'c', winmm = 'c' }
+  ffi.load = function(name, global)
+    local ok1, lib = pcall(raw_load, name, global)
+    if ok1 then return lib end
+    local stem = tostring(name):gsub('\\', '/'):match('([^/]+)$') or tostring(name)
+    local base = stem:lower():gsub('%.dll$', ''):gsub('%.asi$', '')
+    if winsys[base] then return ffi.C end
+    for _, c in ipairs(__pccompat_so_candidates(tostring(name))) do
+      local ok2, l2 = pcall(raw_load, c, global)
+      if ok2 then return l2 end
+    end
+    error(lib, 2)
+  end
+end
+)LUA", sol::script_pass_on_error);
 }
 
 int luaopen_pccompat(lua_State* L)

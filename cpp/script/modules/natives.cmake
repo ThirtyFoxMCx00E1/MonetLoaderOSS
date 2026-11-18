@@ -36,6 +36,9 @@ target_compile_options(mp_lua_natives PRIVATE -w -fPIC)
 target_compile_definitions(mp_lua_natives PRIVATE
     VERSION="2.10.1" PCRE2_CODE_UNIT_WIDTH=8 PCRE2_STATIC
     SQLITE_THREADSAFE=1 SQLITE_OMIT_LOAD_EXTENSION SQLITE_DEFAULT_MEMSTATUS=0 LUASQL_VERSION_NUMBER="2.7.0"
-    "LUA_COMPAT_ALL" "LUA_COMPAT_5_1")
+    "LUA_COMPAT_ALL" "LUA_COMPAT_5_1" MP_LUAJIT
+    buffer_init=rex_buffer_init buffer_free=rex_buffer_free buffer_clear=rex_buffer_clear
+    buffer_addbuffer=rex_buffer_addbuffer buffer_addlstring=rex_buffer_addlstring
+    buffer_addvalue=rex_buffer_addvalue buffer_pushresult=rex_buffer_pushresult)
 target_link_libraries(mp_lua_natives PRIVATE pcre2-8-static)
 target_link_libraries(${PROJECT_NAME} PRIVATE mp_lua_natives pcre2-8-static)
